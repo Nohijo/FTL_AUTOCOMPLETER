@@ -35,6 +35,19 @@ CFPS_FPS = CFPS + 0x1C              # frames counted in the last second
 CFPS_SPEED_FACTOR = CFPS + 0x18     # float, this frame's time step
 CFPS_SPEED_LEVEL = CFPS + 0x24      # int
 SPEED_LEVEL_RANGE = (0, 112)        # what ftl_host will write: 1x .. 50x
+# Turbo: draw only every Nth frame. CApp::OnExecute calls CApp::OnRender (which draws the
+# whole frame and swaps buffers) after every CApp::OnLoop; drawing is what limits FTL's frame
+# rate in a software-rendered window, and game speed is capped per frame (CFPS::OnLoop), so
+# skipping draws runs more game frames per second. ftl_host redirects that one call to a
+# 26-byte hook in the unused tail of the code segment; the hook counts frames in the unused
+# tail of .bss. Only in the running game's memory; FTL.amd64 on disk is never touched.  REA
+RENDER_CALL = 0x41CD6D              # call CApp::OnRender, in CApp::OnExecute
+RENDER_CALL_ORIGINAL = bytes.fromhex("e83ef1ffff")
+RENDER_FUNC = 0x41BEB0              # CApp::OnRender
+RENDER_HOOK = 0x827D00              # unused, zero-filled tail of the r-x segment (ends 0x827C58)
+RENDER_COUNTER = 0xA7DF00           # unused tail of .bss (ends 0xA7D060)
+RENDER_EVERY = 0xA7DF04             # int: draw 1 frame in N
+RENDER_SKIP_RANGE = (1, 16)
 SETTINGS_ALT_PAUSE = 0xA3C179       # Settings::settings.altPause: pause when FTL loses focus
 SETTINGS_FULLSCREEN = 0xA3C160      # Settings::settings.fullscreen: fullscreen also pauses on focus loss
 MOUSE_POSITION = 0x00       # Point: last mouse position, in game coordinates

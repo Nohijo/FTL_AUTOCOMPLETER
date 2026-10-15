@@ -935,6 +935,8 @@ def drag_beam(game: GameInput, snapshot: GameSnapshot, room, start: tuple[float,
 
 
 BEAM_DRAG = 90                            # pixels (about 2.5 tiles) from the press point
+VERIFY_WAIT = 0.06                        # after an input, before reading its result (FTL: ~9 ms a frame)
+HOVER_WAIT = 0.05                         # after a hover, before reading what the game sees under it
 SYSTEM_OF_KEY = {"start_hacking": "hacking", "send_tele": "teleporter", "ret_tele": "teleporter", "mind": "mind"}
 
 
@@ -961,7 +963,7 @@ def system_target(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot,
         selected = gui + L.CommandGui.COMBAT_CONTROL + L.CombatControl.SELECTED_ROOM
         for x, y in spots:
             game.hover(ox + x, oy + y, snapshot.mapping)
-            time.sleep(0.05)
+            time.sleep(HOVER_WAIT)
             if proc.i32(selected) == room.room_id:
                 game.slow_click(ox + x, oy + y, snapshot.mapping)
                 break
@@ -973,7 +975,7 @@ def system_target(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot,
         game.slow_click(ox + room.x + room.w / 2, oy + room.y + room.h / 2, snapshot.mapping)
     if not live:
         return True, None
-    time.sleep(0.3)
+    time.sleep(2 * VERIFY_WAIT)
     after = read_snapshot(proc).player.systems.get(name)
     keys = {"hacking": ("targeted",), "teleporter": ("can_send",), "mind": ("can_use", "controlled")}[name]
     if after is not None and any(after.special.get(k) != before.get(k) for k in keys):
@@ -1002,7 +1004,7 @@ def aim_weapon(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, li
     seen = None
     for x, y in spots:
         game.hover(ox + x, oy + y, snapshot.mapping)
-        time.sleep(0.05)
+        time.sleep(HOVER_WAIT)
         seen = proc.i32(selected_room)
         if seen == room.room_id:
             weapon = snapshot.player.weapons[intent.weapon_index]
@@ -1024,7 +1026,7 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
         # FTL's Open All Doors / Close All Doors hotkeys (default Z / X).
         done = game.press("open" if intent.want_open else "close", snapshot)
         if done and live:
-            time.sleep(0.15)
+            time.sleep(VERIFY_WAIT)
             doors = read_snapshot(proc).player.doors
             moved = any(d.open == intent.want_open for d in doors) if intent.want_open else not any(
                 d.open and d.airlock for d in doors)
@@ -1035,7 +1037,7 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
         done, note = aim_weapon(intent, game, proc, snapshot, live)
         if not (done and live):
             return done, note
-        time.sleep(0.12)
+        time.sleep(VERIFY_WAIT)
         if weapon_armed(proc):
             game.cancel_aim()
             return False, "a weapon was left armed; cancelled it"
@@ -1055,7 +1057,7 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
         # The autofire key toggles every weapon's autoFiring (ProjectileFactory.autoFiring).
         done = game.press("autofire", snapshot)
         if done and live:
-            time.sleep(0.15)
+            time.sleep(VERIFY_WAIT)
             weapons = read_snapshot(proc).player.weapons
             now_on = any(w.auto_firing for w in weapons)
             return now_on == intent.want_open, ("ok" if now_on == intent.want_open else "did not switch")
@@ -1071,7 +1073,7 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
     if intent.kind == "unpower_drone":
         done = game.press(f"drone{intent.weapon_index + 1}", snapshot, shift=True)   # Shift+key powers it down
         if done and live:
-            time.sleep(0.15)
+            time.sleep(VERIFY_WAIT)
             drones = read_snapshot(proc).player.drones
             off = intent.weapon_index < len(drones) and not drones[intent.weapon_index].powered
             return off, ("ok: stood down" if off else "still powered")
@@ -1079,7 +1081,7 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
     if intent.kind == "power_drone":
         done = game.press(f"drone{intent.weapon_index + 1}", snapshot)
         if done and live:
-            time.sleep(0.15)
+            time.sleep(VERIFY_WAIT)
             drones = read_snapshot(proc).player.drones
             powered = intent.weapon_index < len(drones) and drones[intent.weapon_index].powered
             return powered, ("ok: launched" if powered else "did not launch")
@@ -1092,7 +1094,7 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
         add = intent.kind == "power_system"
         done = game.press(intent.system, snapshot, shift=not add)
         if done and live and before is not None:
-            time.sleep(0.12)
+            time.sleep(VERIFY_WAIT)
             after = read_snapshot(proc).player.systems.get(intent.system)
             changed = after is not None and (after.power > before.power if add else after.power < before.power)
             return changed, (f"ok: {after.power} bars" if changed else "power did not change")
@@ -1104,7 +1106,7 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
     if not (done and live):
         return done, None
 
-    time.sleep(0.12)
+    time.sleep(VERIFY_WAIT)
     # Never leave a weapon armed: FTL can crash if one dangles across a game load.
     if intent.kind in ("power_weapon", "target") and weapon_armed(proc):
         game.cancel_aim()
@@ -1159,7 +1161,7 @@ def main():
     parser.add_argument("--no-jump", action="store_true", help="leave jumping and sector choice to you")
     parser.add_argument("--no-shop", action="store_true", help="leave stores to you")
     parser.add_argument("--no-upgrade", action="store_true", help="leave ship upgrades to you")
-    parser.add_argument("--hz", type=float, default=5.0, help="decisions per second (default 5)")
+    parser.add_argument("--hz", type=float, default=15.0, help="decisions per second (default 15)")
     parser.add_argument("--no-dash", action="store_true", help="do not start the browser dashboard")
     args = parser.parse_args()
 
@@ -1210,6 +1212,7 @@ def main():
     settings = bot_settings.load()
     speed_problem = None
     slowed_for_boss = False
+    combat_upgrade_after = 0.0
     try:
         while proc.alive():
             now = time.monotonic()
@@ -1385,8 +1388,9 @@ def main():
                     print(line)
                 # FTL ignores keys for a moment while a dialog or fight winds down: wait before
                 # opening the store or the upgrade screen.
-                if snapshot.event_open or snapshot.map_open or snapshot.menu_open or in_combat(snapshot):
-                    last_window = now
+                jumping = snapshot.player is not None and (snapshot.player.jumping or snapshot.player.jump_animating)
+                if snapshot.event_open or snapshot.map_open or snapshot.menu_open or in_combat(snapshot) or jumping:
+                    last_window = now               # (FTL ignores the screen keys mid-jump)
                 calm = (not intents and may_act and not in_combat(snapshot) and not snapshot.event_open
                         and not snapshot.map_open and not snapshot.menu_open and now - last_window > 2.5
                         and rewards.waiting() is None)     # no windows while a wreck's reward is due
@@ -1420,7 +1424,9 @@ def main():
                     except (MemoryReadError, AttributeError, IndexError, KeyError, TypeError) as error:
                         print(f"[bot] upgrading failed: {error}")
                     game.drain_log()
-                elif not intents and not args.no_jump and may_act and not shopping:
+                elif (not intents and not args.no_jump and may_act and not shopping
+                      and not (not args.no_upgrade and upgrades.pending(snapshot))):
+                    # (Spend the scrap on upgrades first: they run once things are calm.)
                     try:
                         for line in jumps.step(snapshot, now):
                             print(line)
@@ -1429,6 +1435,29 @@ def main():
                     except (MemoryReadError, AttributeError, IndexError, KeyError) as error:
                         print(f"[bot] could not plan the jump: {error}")
                     game.drain_log()
+
+                # Scrap is strength only once it is spent: in a fight too (FTL pauses while the
+                # ship screen is open), e.g. a shield layer or engine bar mid-battle.
+                if not in_combat(snapshot):
+                    combat_upgrade_after = min(combat_upgrade_after, now)   # a new fight may try again
+                if (may_act and not args.no_upgrade and in_combat(snapshot) and not snapshot.event_open
+                        and not snapshot.menu_open and not snapshot.ship_screen_open
+                        and now >= combat_upgrade_after and upgrades.pending(snapshot)):
+                    combat_upgrade_after = now + 15.0
+                    try:
+                        if weapon_armed(proc):
+                            game.cancel_aim()
+                        lines = upgrades.step(snapshot)
+                        for line in lines:
+                            print(line.replace("[bot] ", "[bot] (mid-fight) ", 1))
+                        if any("could not open" in line for line in lines):
+                            combat_upgrade_after = float("inf")     # FTL keeps it shut in this fight
+                    except FocusLost:
+                        upgrades.interrupted()
+                    except (MemoryReadError, AttributeError, IndexError, KeyError, TypeError) as error:
+                        print(f"[bot] upgrading mid-fight failed: {error}")
+                    game.drain_log()
+                    continue
 
                 for intent in intents:
                     if intent.kind == "escape" and may_act:

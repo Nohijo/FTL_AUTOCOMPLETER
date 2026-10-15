@@ -96,33 +96,81 @@ def _store_value(snapshot: GameSnapshot) -> float:
     return value
 
 
-BOSS_PREP_HULL = 0.6         # Last Stand: below this much hull, visit a store before the Flagship...
-BOSS_PREP_SCRAP = 30         # ...when there is scrap for repairs
-BOSS_PREP_MAX_JUMPS = 3      # ...and it is this close
+BOSS_PREP_HULL = 0.5         # Last Stand: below this much hull, a free repair station first (if in time)
+BOSS_STORE_HULL = 0.5        # ...or a store repair (costs scrap)
+BOSS_CRITICAL_HULL = 0.35    # ...and below this, repair even if the Flagship reaches the base first
+BOSS_PREP_SCRAP = 30         # a store repairs only with scrap; repair stations are free
+BOSS_SPEND_SCRAP = 150       # with this much scrap, a store visit (weapons, systems) is worth a detour
+BOSS_PREP_MAX_JUMPS = 4
+BOSS_BASE_SLACK = 0          # the base falls almost as soon as the Flagship arrives (seen 2026-10-15)
 BOSS_MAX_LOOKAHEAD = 16
+REPAIR_EVENTS = {"BOSS_REPAIR_STATION"}   # Last Stand stations: a free full hull repair (events_boss.xml)
+HOSTILE_EVENTS = {"BOSS_SCOUT", "REBEL", "ROGUE_REBEL", "BOSS_FLEETS_BOTH_FIGHT"}   # a fight waits there
+
+
+def _dangerous(beacon) -> bool:
+    """A rebel fleet beacon (anti-ship batteries), or an unvisited beacon with a hostile ship."""
+    return beacon.overtaken or (not beacon.visited and beacon.event_name in HOSTILE_EVENTS)
 
 
 def _boss_intercept(state: StarMapState, start: int, jumps_done: int, max_jumps: int):
+    """See _boss_intercept_through; prefers a way around rebel fleet beacons."""
+    return (_boss_intercept_through(state, start, jumps_done, max_jumps, avoid_fleet=True)
+            or _boss_intercept_through(state, start, jumps_done, max_jumps, avoid_fleet=False))
+
+
+def _boss_intercept_through(state: StarMapState, start: int, jumps_done: int, max_jumps: int,
+                            avoid_fleet: bool):
     """Earliest walk from `start` that ends where the Flagship is when we arrive. The Flagship
     moves before we land (StarMap::GetNewLocation runs UpdateDangerZone -> UpdateBoss first),
     so arriving after jump j meets it at boss_after_jumps(j). Returns (jumps, path) or None."""
     layer = {start: [start]}
     for step in range(1, max_jumps + 1):
         nxt: dict[int, list[int]] = {}
+        target = state.boss_after_jumps(jumps_done + step)
         for address, path in layer.items():
             for other in state.beacons[address].connected:
                 if other in state.beacons and other not in nxt:
+                    if avoid_fleet and other != target and _dangerous(state.beacons[other]):
+                        continue           # fleet batteries or a hostile ship: hull lost on the way
                     nxt[other] = path + [other]
-        target = state.boss_after_jumps(jumps_done + step)
         if target in nxt:
             return step, nxt[target][1:]
         layer = nxt
     return None
 
 
+def _safe_path(state: StarMapState, start: int, goal: int, max_jumps: int, jumps_done: int = 0) -> list[int] | None:
+    """Shortest walk to `goal` that never lands where the Flagship is at that moment
+    (that would start the fight), around rebel fleet beacons when possible."""
+    return (_safe_path_through(state, start, goal, max_jumps, jumps_done, avoid_fleet=True)
+            or _safe_path_through(state, start, goal, max_jumps, jumps_done, avoid_fleet=False))
+
+
+def _safe_path_through(state: StarMapState, start: int, goal: int, max_jumps: int, jumps_done: int,
+                       avoid_fleet: bool) -> list[int] | None:
+    layer = {start: [start]}
+    for step in range(1, max_jumps + 1):
+        boss = state.boss_after_jumps(jumps_done + step)
+        nxt: dict[int, list[int]] = {}
+        for address, path in layer.items():
+            for other in state.beacons[address].connected:
+                if other in state.beacons and other not in nxt and other != boss:
+                    if avoid_fleet and other != goal and _dangerous(state.beacons[other]):
+                        continue
+                    nxt[other] = path + [other]
+        if goal in nxt:
+            return nxt[goal][1:]
+        layer = nxt
+    return None
+
+
 def choose_boss_route(state: StarMapState, snapshot: GameSnapshot, beacon_value) -> Plan | None:
-    """The Last Stand: intercept the Flagship before it reaches the Federation base, with one
-    detour to a store first when the hull needs repairs and the Flagship is still far off."""
+    """The Last Stand: intercept the Flagship before it wrecks the Federation base, but first
+    get the hull repaired - at one of the sector's free repair stations, or a store with
+    scrap - when it is low. Never lands on the Flagship's beacon on the way. Repair early:
+    once the Flagship reaches the base, the game turns the remaining beacons, repair
+    stations included, into rebel fleet beacons (StarMap::TurnIntoFleetLocation)."""
     player = snapshot.player
     current = state.beacons.get(state.current)
     if current is None or state.boss_beacon is None:
@@ -131,23 +179,42 @@ def choose_boss_route(state: StarMapState, snapshot: GameSnapshot, beacon_value)
     direct = _boss_intercept(state, current.address, 0, BOSS_MAX_LOOKAHEAD)
     notes = [f"Last Stand: the Flagship reaches the base in {deadline} jump(s)"
              f"{' (moving on our next jump)' if state.boss_jumping else ''}"]
-    if player.hull < BOSS_PREP_HULL * player.max_hull and player.scrap >= BOSS_PREP_SCRAP:
-        stores = [b for b in state.beacons.values() if b.store and b.address != current.address]
+    hull = player.hull / max(1, player.max_hull)
+    if hull < BOSS_PREP_HULL or player.scrap >= BOSS_SPEND_SCRAP:
+        critical = hull < BOSS_CRITICAL_HULL
+        options = [(b, "repair station") for b in state.beacons.values()
+                   if hull < BOSS_PREP_HULL and b.event_name in REPAIR_EVENTS and not b.visited
+                   and b.address != current.address]
+        if player.scrap >= BOSS_SPEND_SCRAP or (player.scrap >= BOSS_PREP_SCRAP and hull < BOSS_STORE_HULL):
+            options += [(b, "store") for b in state.beacons.values() if b.store and b.address != current.address]
         best = None
-        for store in stores:
-            to_store = _boss_intercept_path(state, current.address, store.address, BOSS_PREP_MAX_JUMPS)
-            if to_store is None:
+        for beacon, kind in options:
+            # A detour must itself be safe: no fleet beacons or hostile ships on the way
+            # (seen: a repair trip through the fleet cost 10 hull and then the base).
+            path = _safe_path_through(state, current.address, beacon.address,
+                                      BOSS_PREP_MAX_JUMPS + (3 if critical else 0), 0, avoid_fleet=True)
+            if path is None:
                 continue
-            after = _boss_intercept(state, store.address, len(to_store), BOSS_MAX_LOOKAHEAD)
-            if after is None or len(to_store) + after[0] > (deadline or 0) + 1:
+            after = _boss_intercept(state, beacon.address, len(path), BOSS_MAX_LOOKAHEAD)
+            total = len(path) + (after[0] if after else BOSS_MAX_LOOKAHEAD)
+            if not critical and total > (deadline or 0) + BOSS_BASE_SLACK:
                 continue
-            if best is None or len(to_store) + after[0] < best[0]:
-                best = (len(to_store) + after[0], to_store)
+            rank = (kind != "repair station", len(path), total)
+            if best is None or rank < best[0]:
+                best = (rank, path, kind, total)
         if best is not None:
-            target = state.beacons[best[1][0]]
-            return Plan(beacon=target, score=0.0, notes=notes + [
-                f"hull {player.hull}/{player.max_hull}: repairs at a store first ({len(best[1])} jump(s)), "
-                f"then the Flagship ({best[0]} jumps in all)"])
+            _, path, kind, total = best
+            why = (f"hull {player.hull}/{player.max_hull}" if hull < BOSS_PREP_HULL
+                   else f"{player.scrap} scrap to spend")
+            return Plan(beacon=state.beacons[path[0]], score=0.0, notes=notes + [
+                f"{why}: to a {kind} first ({len(path)} jump(s)), then the Flagship (~{total} jumps in all)"])
+        if critical:
+            # Nowhere to repair in time: at least do not fly into the Flagship like this.
+            safe = sorted((a for a in current.connected if a in state.beacons and a != state.boss_after_jumps(1)),
+                          key=lambda a: (_dangerous(state.beacons[a]), not state.beacons[a].visited))
+            if safe and direct is not None and direct[0] <= 1:
+                return Plan(beacon=state.beacons[safe[0]], score=0.0, notes=notes + [
+                    f"hull {player.hull}/{player.max_hull}: no repair reachable; keeping away from the Flagship"])
     if direct is None:
         return None
     jumps, path = direct
@@ -155,23 +222,6 @@ def choose_boss_route(state: StarMapState, snapshot: GameSnapshot, beacon_value)
     return Plan(beacon=target, score=0.0, notes=notes + [
         f"intercepting the Flagship in {jumps} jump(s)"
         + (" - next jump meets it" if jumps == 1 else "")])
-
-
-def _boss_intercept_path(state: StarMapState, start: int, goal: int, max_jumps: int) -> list[int] | None:
-    """Shortest path (beacon addresses after start) to goal, at most max_jumps long."""
-    seen = {start: [start]}
-    frontier = [start]
-    for _ in range(max_jumps):
-        nxt = []
-        for address in frontier:
-            for other in state.beacons[address].connected:
-                if other in state.beacons and other not in seen:
-                    seen[other] = seen[address] + [other]
-                    if other == goal:
-                        return seen[other][1:]
-                    nxt.append(other)
-        frontier = nxt
-    return None
 
 
 def choose_destination(state: StarMapState, snapshot: GameSnapshot, beacon_value) -> Plan | None:

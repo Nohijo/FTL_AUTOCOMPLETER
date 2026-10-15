@@ -18,4 +18,7 @@ LOG_DIR = PROJECT_DIR / "data" / "logs"
 # Run FTL in its own Xephyr window (game_display.py): the bot plays there without touching
 # your real mouse/keyboard, and the game keeps running while you use other windows.
 NESTED_DISPLAY = True
+# Draw FTL on the GPU (Mesa's Zink: OpenGL over the GPU's Vulkan driver): Xephyr alone only
+# offers software OpenGL, which caps FTL's frame rate and so the game speed.
+GPU_RENDER = False  # Zink renders on the GPU (~10x) but its frames never reach the Xephyr window (no DRI3)
 BACKUP_DIR = PROJECT_DIR / "backups"

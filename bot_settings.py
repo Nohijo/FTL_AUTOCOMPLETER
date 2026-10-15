@@ -15,7 +15,8 @@ from observer.memory import layout as L
 
 SETTINGS_FILE = PROJECT_DIR / "data" / "bot_settings.json"
 DEFAULTS = {"autoplay": True, "speed": 0, "overlay": True}
-SPEED_STEPS = [0, 1, 2, 3, 5, 7, 10, 14, 18, 21, 30, 42, 58, 78, 112]  # 1x .. 50x
+SPEED_STEPS = [0, 1, 2, 3, 5, 7, 10, 14, 18, 21, 30, 42, 58, 78, 112]  # nominal 1x .. 50x; the real
+# speed is lower once FTL's per-frame cap is reached (about level 10 at ~140 fps: ~4.4x)
 
 
 def step_speed(level: int, direction: int) -> int:
@@ -26,7 +27,8 @@ def step_speed(level: int, direction: int) -> int:
 
 
 def speed_multiplier(level: int) -> float:
-    """How much faster the game runs at a speed level (before the per-frame cap)."""
+    """The nominal speed of a level, before FTL's per-frame cap (the overlay and dashboard
+    show the real speed, measured from FTL's game clock)."""
     return (16 + 7 * level) / 16
 
 
@@ -56,14 +58,33 @@ def save(settings: dict) -> dict:
     return merged
 
 
+# FTL caps the game time of one frame, so above ~level 20 the speed only grows with the frame
+# rate, and in its software-rendered window drawing limits that. The top steps add turbo:
+# draw one frame in N, so N times more game frames run per second (layout.RENDER_*).
+TURBO: tuple = ()   # off: FTL advances some animations (the jump sequence) only on drawn frames
+
+
+def turbo_for(level: int) -> int:
+    return next((every for threshold, every in TURBO if level >= threshold), 1)
+
+
 def apply_speed(proc, level: int) -> str | None:
-    """Set FTL's speed level and read it back. Returns a problem description, or None."""
+    """Set FTL's speed level (and turbo) and read them back. Returns a problem, or None."""
     try:
-        if proc.i32(L.CFPS_SPEED_LEVEL) == level:
-            return None
-        proc.set_speed_level(level)
         if proc.i32(L.CFPS_SPEED_LEVEL) != level:
-            return "this ftl-host is too old to change the speed; Save and Quit FTL and start the bot again"
+            proc.set_speed_level(level)
+            if proc.i32(L.CFPS_SPEED_LEVEL) != level:
+                return "this ftl-host is too old to change the speed; Save and Quit FTL and start the bot again"
     except Exception:   # an ftl-host from before the speed control answers with a failed read
         return "FTL was started before the speed control existed: Save and Quit FTL, then start the bot again"
+    every = turbo_for(level)
+    try:
+        if proc.render_skip() != every:
+            proc.set_render_skip(every)
+            if proc.render_skip() != every:
+                return "turbo did not take"
+    except Exception as error:
+        if every == 1:
+            return None
+        return f"turbo needs a newer ftl-host (FTL restarts with it): {error}"
     return None

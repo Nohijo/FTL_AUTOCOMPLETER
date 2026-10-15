@@ -11,8 +11,10 @@ You rarely need to call it yourself: ftl-bot, ftl-live and ftl-calibrate
 start it when FTL is not running yet. It stops on its own when FTL closes.
 
 The socket (data/ftl_host.sock) is created with mode 0600 and answers memory
-reads. The only write it makes is FTL's own game-speed setting (CFPS::speedLevel,
-range-checked), used by the dashboard's speed control.
+reads. It makes two writes, both range-checked and only in the running game's memory:
+FTL's own game-speed setting (CFPS::speedLevel), and turbo, which makes FTL draw one
+frame in N so more game frames run per second (layout.RENDER_*; installed only after
+checking the code is this exact FTL build).
 """
 
 import argparse
@@ -29,7 +31,7 @@ from pathlib import Path
 import game_display
 from config import FTL_DATA_DIR, LOG_DIR, NESTED_DISPLAY, PROJECT_DIR
 from observer.memory.process import (
-    MAX_HOST_READ, REQUEST, RESPONSE_HEADER, SET_SPEED_LEVEL, AttachError, FTLProcess, MemoryReadError,
+    MAX_HOST_READ, REQUEST, RESPONSE_HEADER, SET_RENDER_SKIP, SET_SPEED_LEVEL, AttachError, FTLProcess, MemoryReadError,
     _recv_exact, find_ftl_pid,
 )
 
@@ -56,6 +58,12 @@ def make_handler(proc: FTLProcess):
                         proc.set_speed_level(level)
                         ok, payload = 1, b""
                     except MemoryReadError as error:
+                        ok, payload = 0, str(error).encode()
+                elif address == SET_RENDER_SKIP:
+                    try:
+                        proc.set_render_skip(size)
+                        ok, payload = 1, b""
+                    except (MemoryReadError, OSError) as error:
                         ok, payload = 0, str(error).encode()
                 elif size > MAX_HOST_READ:
                     ok, payload = 0, f"read of {size} bytes exceeds {MAX_HOST_READ}".encode()

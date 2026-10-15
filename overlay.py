@@ -219,14 +219,23 @@ def run():
         """The top bar: the sector and the switches; the game itself shows the ship's state."""
         settings = state.get("settings", {})
         auto = settings.get("autoplay", True)
-        speed = bot_settings.speed_multiplier(settings.get("speed", 0))
         game = state["game"]
+        # The real speed, measured from FTL's game clock: the setting alone overstates it
+        # (FTL caps the game time of one frame; past ~level 10 only more frames per second help).
+        real = game.get("speed_real")
+        nominal = bot_settings.speed_multiplier(settings.get("speed", 0))
+        if real is None:
+            speed_text = f"SPEED {nominal:.1f}x"
+        elif real < 0.05:
+            speed_text = "SPEED paused"
+        else:
+            speed_text = f"SPEED {real:.1f}x" + (" (FTL's max here)" if nominal > real * 1.3 else "")
         controls = []
         if game.get("connected") and game.get("sector"):
             controls.append((f"SECTOR {game['sector']}", (0.85, 0.88, 0.9), True))
         controls += [(f"[F9] AUTO-PLAY {'ON' if auto else 'OFF  (manual control)'}",
                      (0.25, 0.73, 0.31) if auto else (0.82, 0.6, 0.13), True),
-                    (f"[F10 / F11] SPEED {speed:.1f}x", (0.74, 0.55, 1.0), True),
+                    (f"[F10 / F11] {speed_text}", (0.74, 0.55, 1.0), True),
                     ("[F12] DASHBOARD", (0.35, 0.65, 1.0), True)]
         if not state["game"].get("connected"):
             controls.append(("bot not connected to FTL", (0.6, 0.6, 0.6), False))
@@ -253,7 +262,7 @@ def run():
                     level = bot_settings.step_speed(settings["speed"], 1 if action == "faster" else -1)
                     settings = bot_settings.save({"speed": level})
                     problem = link.apply_speed(level)
-                    note = problem or f"speed {bot_settings.speed_multiplier(level):.1f}x"
+                    note = problem or f"speed setting {level} (the bar shows the real speed)"
                 state["settings"] = settings
                 state["notice"] = (note, time.monotonic() + (8 if note.startswith("FTL was") else 3))
                 if top.get_visible():

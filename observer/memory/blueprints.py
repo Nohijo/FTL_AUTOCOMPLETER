@@ -14,10 +14,27 @@ _MINI_COUNT = 0xCC             # flak: real projectiles per shot
 _CHARGE_LEVELS = 0x184         # chain / charge weapons
 
 
+# Blueprints never change while FTL runs: read each one once per FTL process.
+_CACHE: dict[tuple, dict] = {}
+
+
+def _cached(proc: FTLProcess, kind: str, blueprint: int, read) -> dict:
+    key = (getattr(proc, "pid", None), kind, blueprint)
+    if key not in _CACHE:
+        if len(_CACHE) > 2000:
+            _CACHE.clear()
+        _CACHE[key] = read()
+    return dict(_CACHE[key])
+
+
 def weapon_stats(proc: FTLProcess, blueprint: int) -> dict:
     """Everything the bot weighs about a weapon. Fire and breach chances are in tenths."""
     if not blueprint:
         return {}
+    return _cached(proc, "weapon", blueprint, lambda: _weapon_stats(proc, blueprint))
+
+
+def _weapon_stats(proc: FTLProcess, blueprint: int) -> dict:
     view = proc.view(blueprint, L.WeaponBlueprint.SIZE)
     stats = {"name": proc.string(blueprint + L.Blueprint.NAME),
              "type": proc.string(blueprint + L.WeaponBlueprint.TYPE_NAME),
@@ -36,7 +53,7 @@ def weapon_stats(proc: FTLProcess, blueprint: int) -> dict:
 def drone_stats(proc: FTLProcess, blueprint: int) -> dict:
     if not blueprint:
         return {}
-    return {"name": proc.string(blueprint + L.Blueprint.NAME),
+    return _cached(proc, "drone", blueprint, lambda: {"name": proc.string(blueprint + L.Blueprint.NAME),
             "type": proc.string(blueprint + L.DroneBlueprint.TYPE_NAME),
             "power": proc.i32(blueprint + L.DroneBlueprint.POWER),
-            "cost": proc.i32(blueprint + L.BLUEPRINT_COST)}
+            "cost": proc.i32(blueprint + L.BLUEPRINT_COST)})

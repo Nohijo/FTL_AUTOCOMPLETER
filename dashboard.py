@@ -16,6 +16,7 @@ import os
 import signal
 import subprocess
 import sys
+import struct
 import threading
 import time
 import urllib.request
@@ -45,6 +46,23 @@ class GameLink:
     def __init__(self):
         self.lock = threading.Lock()
         self.client = None
+        self.clock = None                  # (real time, FTL's game clock) at the last speed sample
+        self.speed_real = None
+
+    def _measure_speed(self) -> float | None:
+        """The speed the game really runs at: game seconds per real second, from FTL's own
+        game clock (CFPS: +0x0 grows by speedFactor/16 every unpaused frame). The speed
+        setting alone overstates it: FTL caps the game time of one frame, so past a point
+        only a higher frame rate makes the game faster. 0 while paused."""
+        now = time.monotonic()
+        clock = struct.unpack("<f", self.client.read(L.CFPS, 4))[0]
+        if self.clock is not None and now - self.clock[0] >= 0.5:
+            rate = max(0.0, (clock - self.clock[1]) / (now - self.clock[0]))
+            self.speed_real = rate if self.speed_real is None else 0.5 * self.speed_real + 0.5 * rate
+            self.clock = (now, clock)
+        elif self.clock is None or clock < self.clock[1]:
+            self.clock = (now, clock)
+        return self.speed_real
 
     def state(self) -> dict:
         with self.lock:
@@ -56,6 +74,8 @@ class GameLink:
                         self.client = HostClient(SOCKET_PATH)
                     state = summarize(read_snapshot(self.client))
                     state["speed_level"] = self.client.i32(L.CFPS_SPEED_LEVEL)
+                    state["speed_real"] = self._measure_speed()
+                    state["fps"] = self.client.i32(L.CFPS_FPS)
                     return state
                 except (AttachError, MemoryReadError, OSError) as error:
                     self.client = None
@@ -160,7 +180,8 @@ td { padding:3px 4px; border-top:1px solid var(--line); }
 <nav id="controls">
   <button id="autoplay" title="On: the bot plays, also while FTL is behind other windows. Off: manual control (F9 in the game)">Auto-play: …</button>
   <button id="overlay" title="Show the bot's status in the black bars above and below the game">Overlay on game: …</button>
-  <span class="dim">Game speed</span><span id="speeds"></span>
+  <span class="dim">Game speed setting</span><span id="speeds"></span>
+  <span id="real-speed" class="pill" title="Measured from FTL's game clock. FTL caps the game time of one frame, so past a point a higher setting adds nothing: only more frames per second do."></span>
   <span id="settings-note" class="dim"></span>
 </nav>
 <main>
@@ -233,6 +254,9 @@ async function pollState() {
   conn.textContent = s.connected ? "connected" : "not connected: " + (s.reason || "");
   conn.className = "pill " + (s.connected ? "on" : "bad");
   if (!s.connected) return;
+  if (s.speed_real != null)
+    document.getElementById("real-speed").textContent = s.speed_real < 0.05 ? "real speed: paused"
+      : `real speed: ${s.speed_real.toFixed(1)}× (${s.fps} fps)`;
   document.getElementById("where").textContent = s.screen === "in_run" ? `sector ${s.sector} · ${s.location || "beacon"}` : s.screen;
   const flags = [["COMBAT", s.combat, true], ["paused", s.paused], ["event", s.event_open], ["store", s.store_open], ["map", s.map_open]]
     .filter(f => f[1]).map(f => `<span class="pill ${f[2] ? "bad" : "on"}">${f[0]}</span>`);

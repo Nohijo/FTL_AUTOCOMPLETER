@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from itertools import combinations
 
 SCRAP_PER_DPS = 450.0          # a weapon that adds 0.2 damage per second through shields is worth ~90 scrap
-EXPECTED_SHIELDS = {1: 1.0, 2: 1.0, 3: 1.5, 4: 2.0, 5: 2.0, 6: 2.5, 7: 3.0, 8: 4.0}   # layers by sector
+EXPECTED_SHIELDS = {1: 1.0, 2: 1.0, 3: 1.5, 4: 2.0, 5: 2.0, 6: 2.5, 7: 3.0, 8: 3.5}   # layers by sector (Flagship: 4)
 ACCURACY = 0.8                 # projectiles miss now and then (enemy dodge)
 FLAK_ACCURACY = 0.7            # flak scatters over the target area
 MISSILE_INTERCEPT = 0.85       # defense drones shoot some missiles down
@@ -72,10 +72,13 @@ def _volley(weapons: list[dict], layers: int, missiles_left: int) -> float:
     projectile = [w for w in weapons if kind(w) in ("laser", "ion", "flak")]
     beams = [w for w in weapons if kind(w) == "beam"]
     pierce_all = [w for w in weapons if kind(w) in ("missile", "bomb")]
-    # Ion locks layers between volleys when it comes back often enough.
-    ion_lock = sum(w.get("ion", 0) for w in weapons if w.get("cooldown", 99) <= 10 and kind(w) in ("ion", "laser", "flak"))
-    up = max(0, layers - ion_lock)
     cycle = max([w.get("cooldown", 10) for w in projectile + beams] or [10.0])
+    # Ion locks layers between volleys when it comes back often enough; bombs and missiles
+    # aimed at the shield room knock out bars (2 bars = 1 layer) until it is repaired.
+    ion_lock = sum(w.get("ion", 0) for w in weapons if w.get("cooldown", 99) <= 10 and kind(w) in ("ion", "laser", "flak"))
+    knocked = sum((w.get("system_damage", 0) + w.get("damage", 0) + w.get("ion", 0)) / 2.0
+                  for w in pierce_all if w.get("cooldown", 99) <= cycle * 1.25)
+    up = max(0, layers - ion_lock - int(knocked))
 
     # One volley: the cheapest shots go first and soak the layers, the rest hit.
     shots = []
@@ -104,7 +107,7 @@ def _volley(weapons: list[dict], layers: int, missiles_left: int) -> float:
             per_second += extra * through / cycle
     ammo = 1.0 if missiles_left >= 8 else 0.7 if missiles_left >= 3 else 0.3 if missiles_left >= 1 else 0.0
     for w in pierce_all:
-        hit = w.get("damage", 0) + _extras(w)
+        hit = w.get("damage", 0) + _extras(w)      # bombs: no hull damage (damage 0), systems and crew only
         if kind(w) == "missile":
             per_second += ammo * MISSILE_INTERCEPT * ACCURACY * _shots(w) * hit / max(1.0, w.get("cooldown", 10))
         else:

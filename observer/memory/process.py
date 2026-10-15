@@ -15,11 +15,13 @@ import ctypes.util
 import errno
 import hashlib
 import os
+import signal
 import socket
 import struct
 import subprocess
 from pathlib import Path
 
+import config
 from observer.memory import layout
 
 
@@ -107,8 +109,14 @@ class FTLProcess:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             output = open(log_path, "ab")
 
+        command = [str(executable)]
+        if display and getattr(config, "GPU_RENDER", False):
+            # Xephyr only offers software OpenGL (no DRI3). Mesa's Zink runs FTL's OpenGL on the
+            # GPU through Vulkan and copies each frame into the window; no wrapper or preload
+            # (VirtualGL's preload crashes FTL in glXMakeContextCurrent).
+            env["GALLIUM_DRIVER"] = "zink"
         popen = subprocess.Popen(
-            [str(executable)],
+            command,
             cwd=data_dir,
             env=env,
             stdout=output,
@@ -173,8 +181,8 @@ class FTLProcess:
         return buffer.raw
 
     def set_speed_level(self, level: int):
-        """The one write this project makes: FTL's own game-speed setting (CFPS::speedLevel,
-        see layout.py). Nothing else in the game's memory is ever changed."""
+        """FTL's own game-speed setting (CFPS::speedLevel, see layout.py). One of the two
+        writes this project makes; the other is turbo (set_render_skip)."""
         low, high = layout.SPEED_LEVEL_RANGE
         if not low <= level <= high:
             raise MemoryReadError(f"speed level {level} outside {low}..{high}")
@@ -186,6 +194,42 @@ class FTLProcess:
         if count != len(data):
             code = ctypes.get_errno() if count < 0 else 0
             raise MemoryReadError(f"setting the speed level failed: {os.strerror(code) if code else count}")
+
+    def set_render_skip(self, every: int):
+        """Turbo (see layout.RENDER_*): FTL draws one frame in `every`. The hook is installed
+        on first use, after checking the call site still holds the original call (this exact
+        FTL build) and the hook area is unused; FTL is paused for the 5-byte switch."""
+        low, high = layout.RENDER_SKIP_RANGE
+        if not low <= every <= high:
+            raise MemoryReadError(f"render skip {every} outside {low}..{high}")
+        hook = _render_hook()
+        call = b"\xe8" + struct.pack("<i", layout.RENDER_HOOK - (layout.RENDER_CALL + 5))
+        current = self.read(layout.RENDER_CALL, 5)
+        if current not in (layout.RENDER_CALL_ORIGINAL, call):
+            raise MemoryReadError(f"unexpected code at 0x{layout.RENDER_CALL:x} ({current.hex()}): not FTL 1.6.12")
+        with open(f"/proc/{self.pid}/mem", "r+b", buffering=0) as mem:
+            mem.seek(layout.RENDER_EVERY)
+            mem.write(struct.pack("<i", every))
+            if current == call:
+                return
+            area = self.read(layout.RENDER_HOOK, len(hook))
+            if area not in (bytes(len(hook)), hook):
+                raise MemoryReadError("the hook area is in use: not FTL 1.6.12")
+            mem.seek(layout.RENDER_HOOK)
+            mem.write(hook)
+            os.kill(self.pid, signal.SIGSTOP)
+            try:
+                mem.seek(layout.RENDER_CALL)
+                mem.write(call)
+            finally:
+                os.kill(self.pid, signal.SIGCONT)
+
+    def render_skip(self) -> int:
+        """The current turbo setting (1 = every frame drawn, also before the hook exists)."""
+        call = b"\xe8" + struct.pack("<i", layout.RENDER_HOOK - (layout.RENDER_CALL + 5))
+        if self.read(layout.RENDER_CALL, 5) != call:
+            return 1
+        return max(1, struct.unpack("<i", self.read(layout.RENDER_EVERY, 4))[0])
 
     def view(self, address: int, size: int) -> View:
         return View(address, self.read(address, size))
@@ -248,6 +292,18 @@ class FTLProcess:
 REQUEST = struct.Struct("<QI")
 RESPONSE_HEADER = struct.Struct("<BI")
 SET_SPEED_LEVEL = 1   # request address meaning "set the speed level" (an older host answers with an error)
+SET_RENDER_SKIP = 2   # request address meaning "draw one frame in N" (turbo, see layout.RENDER_*)
+
+
+def _render_hook() -> bytes:
+    """The hook: dec [counter]; jg skip; mov eax,[every]; mov [counter],eax; jmp OnRender; skip: ret."""
+    def rel32(target: int, next_ip: int) -> bytes:
+        return struct.pack("<i", target - next_ip)
+    base = layout.RENDER_HOOK
+    return (b"\xff\x0d" + rel32(layout.RENDER_COUNTER, base + 6) + b"\x7f\x11"
+            + b"\x8b\x05" + rel32(layout.RENDER_EVERY, base + 14)
+            + b"\x89\x05" + rel32(layout.RENDER_COUNTER, base + 20)
+            + b"\xe9" + rel32(layout.RENDER_FUNC, base + 25) + b"\xc3")
 MAX_HOST_READ = 1 << 20
 
 
@@ -284,6 +340,13 @@ class HostClient(FTLProcess):
         if not ok:
             raise MemoryReadError(payload.decode("utf-8", errors="replace"))
         return payload
+
+    def set_render_skip(self, every: int):
+        """Ask ftl_host for turbo: FTL draws one frame in `every` (request address 2)."""
+        try:
+            self._request(SET_RENDER_SKIP, every & 0xFFFFFFFF)
+        except (ConnectionError, OSError) as error:
+            raise MemoryReadError(f"ftl_host connection lost: {error}") from error
 
     def set_speed_level(self, level: int):
         """Ask ftl_host to set FTL's game speed (request address 1, the level in the size field)."""

@@ -21,6 +21,7 @@ from pathlib import Path
 import game_display
 
 from controller.x11_direct import DirectInput
+from controller.xtest_input import XTestInput
 from observer.memory.reader import GameSnapshot, ScreenMapping
 
 _XDOTOOL_COMMANDS = {"mousemove", "click", "mousedown", "mouseup", "key", "keydown", "keyup", "sleep"}
@@ -89,6 +90,13 @@ class GameInput:
         self.log: list[str] = []
         self.direct_mode = False           # auto-play: every event goes straight to FTL's window
         self.direct: DirectInput | None = None
+        # In FTL's own display, XTEST through one open connection: no xdotool process per event.
+        self.xtest: XTestInput | None = None
+        if self.nested and not dry_run:
+            try:
+                self.xtest = XTestInput(self.display)
+            except (OSError, RuntimeError):
+                self.xtest = None
 
     def _find_window(self, wait: float = 30.0) -> str:
         """FTL's window; a freshly launched FTL takes a few seconds to open it."""
@@ -136,6 +144,11 @@ class GameInput:
             # touching the real pointer or keyboard focus.
             self._send_direct(args)
             return
+        if self.xtest is not None:
+            if self.window is None:
+                self.window = self._find_window()
+            self._replay(args, self.xtest)
+            return
         # XTEST goes to the active window, so it is checked before every single event: if the
         # player switched to another window mid-sequence, stop instead of typing into it.
         if self.ftl_is_active():
@@ -148,6 +161,10 @@ class GameInput:
         """Replay an xdotool command line with XSendEvent into the FTL window only."""
         if self.direct is None:
             self.direct = DirectInput(self.display)
+        self._replay(args, self.direct)
+
+    def _replay(self, args: tuple[str, ...], backend):
+        """Run an xdotool command line through an input backend (move / button / key)."""
         window = int(self.window)
         i = 0
         while i < len(args):
@@ -160,15 +177,16 @@ class GameInput:
                     operands.append(args[i])
                 i += 1
             if command == "mousemove":
-                self.direct.move(window, int(operands[0]), int(operands[1]))
+                backend.move(window, int(operands[0]), int(operands[1]))
             elif command == "click":
-                self.direct.button(window, int(operands[0]), True)
-                self.direct.button(window, int(operands[0]), False)
+                backend.button(window, int(operands[0]), True)
+                time.sleep(self.PRESS_SECONDS)
+                backend.button(window, int(operands[0]), False)
             elif command in ("mousedown", "mouseup"):
-                self.direct.button(window, int(operands[0]), command == "mousedown")
+                backend.button(window, int(operands[0]), command == "mousedown")
             elif command in ("keydown", "keyup"):
                 for keysym in operands:
-                    self.direct.key(window, keysym, command == "keydown")
+                    backend.key(window, keysym, command == "keydown")
             elif command == "sleep":
                 time.sleep(float(operands[0]))
             elif command == "key":
@@ -177,11 +195,12 @@ class GameInput:
                     held = [{"shift": "Shift_L", "ctrl": "Control_L", "alt": "Alt_L"}.get(m.lower(), m)
                             for m in modifiers]
                     for key in held:
-                        self.direct.key(window, key, True)
-                    self.direct.key(window, keysym, True)
-                    self.direct.key(window, keysym, False)
+                        backend.key(window, key, True)
+                    backend.key(window, keysym, True)
+                    time.sleep(self.PRESS_SECONDS)     # like xdotool: FTL can miss a press and release in one frame
+                    backend.key(window, keysym, False)
                     for key in reversed(held):
-                        self.direct.key(window, key, False)
+                        backend.key(window, key, False)
 
     def background_keys_work(self) -> bool:
         """Keys sent straight to FTL's window only arrive when FTL runs without an input-method
@@ -223,7 +242,8 @@ class GameInput:
     # FTL picks up pointer motion once per frame. A click sent right after a move is
     # handled at the old position (seen in calibration: orders landed in the last
     # hovered room), so wait for the move to complete and give the game a few frames.
-    SETTLE_SECONDS = 0.06
+    SETTLE_SECONDS = 0.045
+    PRESS_SECONDS = 0.015              # between a key / button going down and up again
 
     def _move(self, wx: int, wy: int):
         """Put the pointer on window pixel (wx, wy). --sync waits until the pointer has moved,
@@ -265,10 +285,10 @@ class GameInput:
         self.hover(game_x + 3, game_y + 3, mapping)
         self.hover(game_x, game_y, mapping)
         if not self.dry_run:
-            time.sleep(0.1)
+            time.sleep(0.05)
         self._xdotool("mousedown", "1")
         if not self.dry_run:
-            time.sleep(0.08)
+            time.sleep(0.04)
         self._xdotool("mouseup", "1")
         if not self.dry_run:
             time.sleep(self.SETTLE_SECONDS)

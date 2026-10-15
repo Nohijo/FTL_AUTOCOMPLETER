@@ -75,7 +75,7 @@ SEND_TO_MEDBAY_AT_PEACE = 0.85   # outside combat healing is free, so top everyo
 HEALED = 0.90
 FIT_FOR_DUTY = 0.40
 
-REISSUE_TARGET_SECONDS = 1.0
+REISSUE_TARGET_SECONDS = 0.5
 VOLLEY_WINDOW_SECONDS = 1.0
 TARGET_HOLD_SECONDS = 8.0          # keep shooting one enemy system at least this long
 HACK_LEAD_SECONDS = 1.5          # fire the hack pulse when a gun is this close to charged
@@ -101,10 +101,11 @@ SPECIES_FIGHT = {"mantis": 1.5, "rock": 1.0, "crystal": 1.1, "engi": 0.5, "zolta
 CREW_AIR_DANGER = 25.0             # room oxygen (%): crew in a room with less air than this -> close every door
 VENT_HOLD_SECONDS = 20.0           # after such an emergency, no venting for this long
 HELPER_STATIONS_IN_COMBAT = 3      # extra hands mid-fight: from the first stations of STATION_SACRIFICE_ORDER only     # guns aimed together fire within this long of each other
-REISSUE_POWER_SECONDS = 2.0
-POWERED_SYSTEMS = ("shields", "engines", "oxygen", "weapons", "drones", "medbay")   # managed reactor users
+REISSUE_POWER_SECONDS = 1.0
+POWERED_SYSTEMS = ("shields", "engines", "oxygen", "weapons", "drones", "medbay",   # managed reactor users
+                   "cloaking", "hacking", "mind", "teleporter")
 AIR_TOP_UP = 95.0                # room oxygen (%) below this makes air the first system to power
-REISSUE_CREW_SECONDS = 5.0
+REISSUE_CREW_SECONDS = 2.5
 REISSUE_ALERT_SECONDS = 30.0
 
 
@@ -215,10 +216,29 @@ class LiveCombatBrain:
         self.last_issued[key] = now
         return True
 
+    def _track_game_rate(self, snapshot: GameSnapshot, now: float):
+        """How many game seconds pass per decision (weapon charge is counted in game seconds).
+        At high game speeds a weapon can go from 'about to fire' to fired between two
+        decisions, so timing windows (cloak, hack pulse) are widened to cover one step."""
+        player = snapshot.player
+        charges = {i: w.charge for i, w in enumerate(player.weapons) if w.powered and 0 < w.charge < w.charge_goal}
+        previous, then = getattr(self, "charge_seen", ({}, now))
+        gains = [charges[i] - previous[i] for i in charges if i in previous and charges[i] > previous[i]]
+        if gains and now > then:
+            rate = sorted(gains)[len(gains) // 2] / (now - then)
+            self.game_rate = 0.7 * getattr(self, "game_rate", rate) + 0.3 * rate
+        self.game_step = getattr(self, "game_rate", 1.0) * max(0.0, now - then)
+        self.charge_seen = (charges, now)
+
+    def _lead(self, base: float, cap: float = 3.0) -> float:
+        """A timing window in game seconds, at least two decisions long."""
+        return min(cap, max(base, 2.0 * getattr(self, "game_step", 0.0)))
+
     def decide(self, snapshot: GameSnapshot, now: float) -> list[Intent]:
         if snapshot.screen != "in_run" or snapshot.player is None or ui_blocks_actions(snapshot):
             return []
         self.now = now
+        self._track_game_rate(snapshot, now)
         for address in list(self.assignments) + list(self.healing):
             self.last_job[address] = now
         intents = self._fire_plan(snapshot, now)
@@ -347,17 +367,25 @@ class LiveCombatBrain:
             if getattr(self, "escaping", False):
                 give("engines", 99)            # running: FTL needs engines (and dodging helps)
             give("shields", 2)
+            if self._intruders(snapshot):
+                give("mind", 99)               # turn a boarder (or free our own crew)
             give("weapons", 99)
             give("engines", 1)                 # dodge, and the ability to jump away
+            give("cloaking", 99)               # dodge a whole volley (longer with more bars)
+            give("hacking", 99)                # takes their shields / weapons down for the volley
             give("drones", drones_now)
             give("engines", 2)
             if wounded:
                 give("medbay", 1)
             give("shields", 99)
             give("engines", 99)
+            give("teleporter", 99)
+            give("mind", 99)
             if wounded:
                 give("medbay", 99)
         else:
+            if self._intruders(snapshot):
+                give("mind", 99)               # boarders from an event, with no ship around
             if plan_oxygen_cap is None:
                 give("oxygen", 1 if not airless else 99)
             give("engines", 1)                 # FTL cannot jump without engine power
@@ -442,7 +470,7 @@ class LiveCombatBrain:
             name, room = target
             return [Intent(kind="system_target", system="start_hacking", room=room,
                            reason=f"hacking: probe to the enemy {name} (room {room.room_id})")]
-        guns_soon = any(w.powered and w.charge_goal - w.charge <= HACK_LEAD_SECONDS for w in player.weapons)
+        guns_soon = any(w.powered and w.charge_goal - w.charge <= self._lead(HACK_LEAD_SECONDS) for w in player.weapons)
         if (state.get("drone_arrived") and state.get("can_hack") and not state.get("active") and guns_soon
                 and self._due(("hack", "pulse"), now, 4.0)):
             return [Intent(kind="system_key", system="start_hacking",
@@ -603,13 +631,13 @@ class LiveCombatBrain:
         if cloak is None or cloak.power <= 0 or cloak.ion_lock or enemy is None or cloak.special.get("on"):
             return []
         about_to_fire = [(label, w) for label, w in flagship.enemy_guns(enemy)
-                         if w.powered and w.charge_goal > 0 and w.charge_goal - w.charge <= CLOAK_LEAD_SECONDS]
+                         if w.powered and w.charge_goal > 0 and w.charge_goal - w.charge <= self._lead(CLOAK_LEAD_SECONDS)]
         if flagship.is_flagship(enemy):
             # The Flagship: the cloak is saved for its power surges (stage 2 drone swarm, stage 3
             # weapon barrage) and otherwise spent only on a pod volley that would really hurt.
             kind = flagship.surge_kind(enemy)
             surge_soon = kind in ("drone swarm", "weapon barrage") and enemy.surge_in is not None
-            if surge_soon and enemy.surge_in <= CLOAK_LEAD_SECONDS and self._due(("cloak",), now, CLOAK_RETRY_SECONDS):
+            if surge_soon and enemy.surge_in <= self._lead(CLOAK_LEAD_SECONDS) and self._due(("cloak",), now, CLOAK_RETRY_SECONDS):
                 return [Intent(kind="cloak", reason=f"cloaking: the Flagship's {kind} is coming")]
             saving = surge_soon and enemy.surge_in < SURGE_CLOAK_SAVE
             ion_alive = any(flagship.role_of(a.weapon) == "ion" for a in enemy.artillery if a.health > 0)
@@ -845,9 +873,13 @@ class LiveCombatBrain:
         # A weapon aimed while still charging fires by itself the moment it is charged, so
         # weapons are aimed early instead of waiting for the bot to notice the charge.
         chosen = []
-        # Missiles and bombs ignore shields: aim them at once.
-        if use_missiles:
-            chosen += [(i, w) for i, w in launchers if player.missiles >= w.missiles_per_shot]
+        # Missiles and bombs ignore shields: aim them at once. Bombs teleport aboard, so a
+        # defense drone cannot shoot them down: they fly even when missiles are held back.
+        bombs_ok = use_missiles or defended
+        for i, w in launchers:
+            is_bomb = bool(w.stats) and arsenal.kind(w.stats) == "bomb"
+            if (use_missiles or (is_bomb and bombs_ok)) and player.missiles >= w.missiles_per_shot:
+                chosen.append((i, w))
         # A gun with more shots than the enemy has shield layers gets damage through on its
         # own: aim it at once too.
         layers = enemy.max_shield_layers + enemy.super_shield

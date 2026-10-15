@@ -60,12 +60,37 @@ def plan_upgrade(state: UpgradesState, ship: ShipInfo, profile=None) -> tuple[st
         ("weapons", 6, "room for stronger weapons"),
         ("pilot", 3, "dodge chance"),
         ("shields", 8, "a fourth shield layer"),
+        # Late game: keep turning scrap into strength (the list used to end here, so scrap
+        # piled up unused once the shields were maxed).
+        ("cloaking", 2, "longer cloak"),
+        ("engines", 6, "dodge chance"),
+        ("weapons", 7, "room for stronger weapons"),
+        ("medbay", 3, "faster healing"),
+        ("engines", 7, "dodge chance"),
+        ("weapons", 8, "room for stronger weapons"),
+        ("hacking", 2, "stronger hacking"),
+        ("cloaking", 3, "longer cloak"),
+        ("drones", 6, "power for more drones"),
+        ("engines", 8, "dodge chance"),
+        ("doors", 3, "stronger doors"),
+        ("oxygen", 3, "faster oxygen refill"),
+        ("sensors", 3, "see enemy weapons charging"),
+        ("teleporter", 2, "faster teleporter"),
+        ("mind", 2, "longer mind control"),
+        ("hacking", 3, "stronger hacking"),
+        ("battery", 2, "more battery power"),
+        ("clonebay", 2, "faster cloning"),
+        ("drones", 8, "power for more drones"),
+        ("teleporter", 3, "faster teleporter"),
+        ("mind", 3, "longer mind control"),
+        ("reactor", None, "spare power"),
     ]
     # This ship's loadout and its past runs reorder the plan (brain/ship_profile.py).
     steps = adapt_upgrade_steps(steps, profile, levels, ship)
     for name, target, reason in steps:
         if name == "reactor":
-            if reactor_total >= min(REACTOR_CAP, _power_wanted(ship, levels)):
+            wanted = REACTOR_CAP if reason == "spare power" else min(REACTOR_CAP, _power_wanted(ship, levels))
+            if reactor_total >= wanted:
                 continue
             cost = reactor_cost(ship.reactor_total or 0, state.reactor_pending)
             if cost <= budget:
