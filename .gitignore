@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+a.out
+
+# Runtime state written while the bot runs
+data/*.sock
+data/*.pid
+data/bot_settings.json
+data/game_display.json
+data/logs/
+data/runs/*
+!data/runs/README.md
+
+# FTL's own game files and data built from them: extract them from your copy of ftl.dat
+# with `python3 tools/build_event_db.py --extract`
+data/ftl_xml/
+data/events_db.json
+
+# Save files
+data/snapshots/
+data/decoded_states/
+backups/
