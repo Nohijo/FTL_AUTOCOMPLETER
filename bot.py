@@ -49,7 +49,7 @@ from brain.ship_profile import adapt_upgrade_steps, profile_for
 from brain.augments import describe as describe_augments
 from brain.flagship import is_flagship
 from brain.arsenal import plan_equipment_move, sell_candidates
-from brain.live_combat import Intent, LiveCombatBrain, heading_to
+from brain.live_combat import Intent, LiveCombatBrain, heading_to, ui_blocks_actions
 from config import FTL_SAVE_DIR, LOG_DIR
 from controller.game_input import FocusLost, GameInput
 from observer.run_log import RunRecorder
@@ -65,17 +65,25 @@ from observer.memory.equipment import read_equipment
 from observer.memory.store import current_store_address, read_store
 from observer.memory.upgrades import read_upgrades
 from observer.memory.process import AttachError, HostClient, MemoryReadError
-from observer.memory.reader import GameSnapshot, read_snapshot, weapon_armed
+from observer.memory.reader import GameSnapshot, _read_crew, read_snapshot, weapon_armed
 
 
 def send_crew(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live: bool) -> tuple[bool, str | None]:
     """Select by hotkey, confirm the selection, order, confirm the crew member is heading there."""
+    if live and weapon_armed(proc):
+        game.cancel_aim()                    # an armed weapon swallows the crew hotkey
+        time.sleep(VERIFY_WAIT)
     if not game.select_crew(intent.crew, snapshot):
         return False, "no crew hotkey for this crew member"
     if live:
-        time.sleep(0.1)
-        selected = read_snapshot(proc).selected_crew
-        if intent.crew.address not in selected:
+        for attempt in range(2):             # a hotkey FTL missed gets one more press
+            time.sleep(0.1)
+            selected = read_snapshot(proc).selected_crew
+            if intent.crew.address in selected:
+                break
+            if attempt == 0:
+                game.select_crew(intent.crew, snapshot)
+        else:
             return False, f"selection failed ({len(selected)} crew selected)"
     game.order_selected_crew_to_room(intent.room, snapshot)
     if not live:
@@ -296,6 +304,85 @@ class EquipmentPilot:
         return lines + [f"[bot] equipment: weapons {', '.join(mounted)}; cargo {', '.join(cargo) or 'empty'}"]
 
 
+class CrewPilot:
+    """Crew over capacity: an event added a crew member with every place taken, and FTL keeps
+    the ship screen open on the crew tab (TabbedWindow.bBlockClose) until someone is
+    dismissed. Pressing Escape does nothing there (seen: the bot closing it every 4 s for
+    minutes). Dismiss the least useful crew member: the plainest species, then the most hurt."""
+
+    KEEP = {"mantis": 5, "engi": 5, "rock": 5, "crystal": 5, "energy": 4, "zoltan": 4, "slug": 4,
+            "anaerobic": 4, "human": 2}
+
+    def __init__(self, game: GameInput, proc, live: bool):
+        self.game, self.proc, self.live = game, proc, live
+        self.retry_after = 0.0
+
+    def _gui(self) -> int:
+        return self.proc.ptr(self.proc.ptr(L.P_THE_APP) + L.CApp.GUI)
+
+    def pending(self, snapshot: GameSnapshot) -> bool:
+        if not snapshot.ship_screen_open or time.monotonic() < self.retry_after:
+            return False
+        return self.proc.bool(self._gui() + L.CommandGui.SHIP_SCREENS + L.TabbedWindow.BLOCK_CLOSE)
+
+    def _hover(self, rect, hovered_at: int, snapshot: GameSnapshot) -> tuple[float, float] | None:
+        """Hover the middle of a hitbox until the game reports it hovered (bool at hovered_at)."""
+        x, y, w, h = rect
+        window = self.proc.view(self._gui() + L.CommandGui.CREW_SCREEN, 0x20).pair_i(0x18)
+        for ox, oy in ((0, 0), window):
+            cx, cy = x + w / 2 + ox, y + h / 2 + oy
+            self.game.hover(cx, cy, snapshot.mapping)
+            time.sleep(0.1)
+            if self.proc.bool(hovered_at):
+                return cx, cy
+        return None
+
+    def step(self, snapshot: GameSnapshot) -> list[str]:
+        gui = self._gui()
+        manifest = gui + L.CommandGui.CREW_SCREEN
+        crew = []
+        for box in self.proc.pointer_vector(manifest + L.CrewManifest.BOXES):
+            address = self.proc.ptr(box + L.EquipmentBox.ITEM + 0x10)
+            if address:
+                member = _read_crew(self.proc, address)
+                if not member.dead:
+                    crew.append((box, member))
+        if len(crew) < 2:
+            self.retry_after = time.monotonic() + 30
+            return ["[bot] crew over capacity, but the crew list could not be read"]
+        box, member = min(crew, key=lambda bc: (self.KEEP.get(bc[1].species.lower(), 3),
+                                                bc[1].health / max(1.0, bc[1].max_health)))
+        why = f"{member.name} ({member.species}, {member.health:.0f}/{member.max_health:.0f} hp)"
+        if not self.live:
+            return [f"[bot] crew over capacity: would dismiss {why}"]
+        view = self.proc.view(box, 0x338)
+        box_rect = struct.unpack_from("<iiii", view.data, L.EquipmentBox.HITBOX)
+        button = box + L.CrewEquipBox.DELETE_BUTTON
+        self._hover(box_rect, box + L.EquipmentBox.HOVER, snapshot)        # shows its Dismiss button
+        spot = self._hover(struct.unpack("<iiii", self.proc.read(button + L.GenericButton.HITBOX, 16)),
+                           button + L.GenericButton.HOVER, snapshot)
+        if spot is None:
+            self.retry_after = time.monotonic() + 30
+            return [f"[bot] crew over capacity: could not find the Dismiss button of {member.name}"]
+        self.game.click(*spot, snapshot.mapping)
+        time.sleep(0.3)
+        dialog = manifest + L.CrewManifest.DELETE_DIALOG
+        if self.proc.bool(dialog + L.FocusWindow.OPEN):
+            yes = dialog + 0x78
+            spot = self._hover(struct.unpack("<iiii", self.proc.read(yes + L.GenericButton.HITBOX, 16)),
+                               yes + L.GenericButton.HOVER, snapshot)
+            if spot is None:
+                self.retry_after = time.monotonic() + 30
+                return [f"[bot] crew over capacity: could not find Yes to dismiss {member.name}"]
+            self.game.click(*spot, snapshot.mapping)
+            time.sleep(0.3)
+        if self.proc.bool(gui + L.CommandGui.SHIP_SCREENS + L.TabbedWindow.BLOCK_CLOSE):
+            self.retry_after = time.monotonic() + 10
+            return [f"[bot] crew over capacity: dismissing {member.name} did not take"]
+        close_window(self.game, self.proc, snapshot, "ship_screen")
+        return [f"[bot] crew over capacity: dismissed {why}, the least useful aboard"]
+
+
 class ShopPilot:
     """At a store beacon: open the store, buy what brain/shopper.py asks for, close it."""
 
@@ -336,7 +423,16 @@ class ShopPilot:
         if page in (0, store.page):
             return True
         rect, _ = store.page_buttons[page]
-        spot = self._hover(rect, ((0, 0), store.position), lambda fresh: fresh.page_buttons[page][1], snapshot)
+        x, y, w, h = rect
+        # Click the tab and check the page really changed: its hover flag does not always
+        # update in time, which made the bot give up whole store visits (26 times in the logs).
+        for attempt in range(2):
+            self.game.slow_click(x + w / 2, y + h / 2, snapshot.mapping)
+            time.sleep(0.25)
+            fresh = read_store(self.proc)
+            if fresh is not None and fresh.page == page:
+                return True
+        spot = self._hover(rect, (store.position,), lambda fresh: fresh.page_buttons[page][1], snapshot)
         if spot is None:
             return False
         self.game.click(*spot, snapshot.mapping)
@@ -446,22 +542,29 @@ class ShopPilot:
         self._equipment_pass(snapshot, lines, arrange=False)
         stock = appraise(read_store(self.proc), read_snapshot(self.proc), read_equipment(self.proc))
         lines += [f"[bot] STORE stock, {line}" for line in stock]
+        unreachable: set[int] = set()
         for _ in range(self.MAX_PURCHASES):
             current = read_snapshot(self.proc)
             store = read_store(self.proc)
+            if store is not None:
+                for box in store.items:
+                    if box.address in unreachable:
+                        box.active = False       # skipped below: the rest of the visit goes on
             plan = next_purchase(store, current, read_equipment(self.proc)) if store else None
             if plan is None:
                 break
             item, reason = plan
             if not self._show_page(item.page, store, current):
-                lines.append(f"[bot] store: could not turn to page {item.page} for {item.name}; stopping")
-                break
+                lines.append(f"[bot] store: could not turn to page {item.page} for {item.name}; skipping it")
+                unreachable.add(item.address)
+                continue
             store = read_store(self.proc)
             item = store.find(item.address) or item
             spot = self._hover_item(item, store, current)
             if spot is None:
-                lines.append(f"[bot] store: could not find the {item.name} button under the mouse; stopping")
-                break
+                lines.append(f"[bot] store: could not find the {item.name} button under the mouse; skipping it")
+                unreachable.add(item.address)
+                continue
             scrap_before = current.player.scrap
             self.game.click(*spot, current.mapping)
             time.sleep(0.35)
@@ -472,8 +575,9 @@ class ShopPilot:
             if scrap_after < scrap_before:
                 lines.append(f"[bot] store: bought {item.name} for {scrap_before - scrap_after} scrap ({reason})")
             else:
-                lines.append(f"[bot] store: clicking {item.name} did not buy it; stopping")
-                break
+                lines.append(f"[bot] store: clicking {item.name} did not buy it; skipping it")
+                unreachable.add(item.address)
+                continue
 
         # A weapon bought into the cargo hold: mount it, then sell the one it replaced.
         self._equipment_pass(snapshot, lines, arrange=True)
@@ -652,18 +756,20 @@ class RewardWatch:
         if in_combat(snapshot):
             self.handled, self.pending = False, None       # a fight on: its reward comes later
             self.crew_seen = max(self.crew_seen, self._aboard(enemy))
+            self.fought = True
             return []
         if self.pending is None:
             if enemy is None:
-                self.handled, self.crew_seen, self.no_crew = False, 0, 0
+                self.handled, self.crew_seen, self.no_crew, self.fought = False, 0, 0, False
                 return []
-            if self.handled:
-                return []
+            if self.handled or not getattr(self, "fought", False):
+                return []                  # (a wreck from before this bot started: already handled)
             destroyed = enemy.destroyed or enemy.hull <= 0
             self.no_crew = getattr(self, "no_crew", 0) + 1 if self._aboard(enemy) == 0 else 0
             crew_killed = self.crew_seen > 0 and self.no_crew >= 2 and not enemy.surrendered
             if not (destroyed or crew_killed):
                 return []
+            self.fought = False
             self.pending = {"enemy": enemy.blueprint, "since": now, "before": self._resources(player),
                             "how": "destroyed" if destroyed else "crew killed", "dialog": False}
             return [f"[bot] REWARD: {enemy.blueprint} {self.pending['how']}; no jump until its reward is in"]
@@ -890,16 +996,25 @@ def toggle_door(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, l
         return True, None
     gui = proc.ptr(proc.ptr(L.P_THE_APP) + L.CApp.GUI)
     crew_control = gui + L.CommandGui.CREW_CONTROL
+    if weapon_armed(proc):
+        game.cancel_aim()                    # an armed weapon takes the mouse, not the doors
+        time.sleep(VERIFY_WAIT)
     if read_snapshot(proc).selected_crew:
         game.click(*DESELECT_SPOT, snapshot.mapping)
         time.sleep(0.1)
     spot = None
-    for dx, dy in ((0, 0), (0, -5), (0, 5), (-5, 0), (5, 0), (0, -9), (0, 9), (-9, 0), (9, 0)):
-        game.hover(ox + door.x + dx, oy + door.y + dy, snapshot.mapping)
-        time.sleep(0.05)
-        if proc.ptr(crew_control + L.CrewControl.SELECTED_DOOR) == door.address:
-            spot = (ox + door.x + dx, oy + door.y + dy)
+    for wait in (0.05, 0.1):                 # a second, slower pass before giving up
+        for dx, dy in ((0, 0), (0, -5), (0, 5), (-5, 0), (5, 0), (0, -9), (0, 9), (-9, 0), (9, 0)):
+            game.hover(ox + door.x + dx, oy + door.y + dy, snapshot.mapping)
+            time.sleep(wait)
+            if proc.ptr(crew_control + L.CrewControl.SELECTED_DOOR) == door.address:
+                spot = (ox + door.x + dx, oy + door.y + dy)
+                break
+        if spot is not None:
             break
+        if read_snapshot(proc).selected_crew:
+            game.click(*DESELECT_SPOT, snapshot.mapping)
+            time.sleep(0.1)
     if spot is None:
         selected = bool(read_snapshot(proc).selected_crew)
         return False, "the game did not show the door under the mouse" + (" (a crew member is still selected)" if selected else "")
@@ -913,9 +1028,12 @@ def toggle_door(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, l
 
 
 def drag_beam(game: GameInput, snapshot: GameSnapshot, room, start: tuple[float, float]):
-    """A beam is aimed by pressing in the target room and dragging: the beam runs from the
-    press point toward the release point. Drag toward the middle of the enemy ship so it
-    crosses more rooms."""
+    """A beam takes two clicks (CombatControl::SelectTarget fires only once aimingPoints holds
+    ProjectileFactory::NumTargetsRequired() = 2 points): one in the target room sets where the
+    beam starts, then, with the mouse moved to where it should end (UpdateAiming turns the
+    mouse position into the end point), a second click fires it. A press-drag-release is only
+    one click and left the beam armed. The beam is swept toward the middle of the enemy ship
+    so it crosses more rooms."""
     ox, oy = snapshot.enemy_origin
     rooms = snapshot.enemy.rooms
     cx = sum(r.x + r.w / 2 for r in rooms) / max(1, len(rooms))
@@ -925,17 +1043,16 @@ def drag_beam(game: GameInput, snapshot: GameSnapshot, room, start: tuple[float,
     if length < 20:                       # the target is the middle: sweep across it instead
         dx, dy, length = 1.0, 0.0, 1.0
     end = (start[0] + dx / length * BEAM_DRAG, start[1] + dy / length * BEAM_DRAG)
-    game.hover(ox + start[0], oy + start[1], snapshot.mapping)
-    game._xdotool("mousedown", "1")
-    for step in range(1, 5):              # move in steps so the game sees the drag
-        t = step / 4
+    game.slow_click(ox + start[0], oy + start[1], snapshot.mapping)      # 1: the start point
+    for step in range(1, 4):              # move there in steps: the game tracks the end point
+        t = step / 3
         game.hover(ox + start[0] + (end[0] - start[0]) * t, oy + start[1] + (end[1] - start[1]) * t,
                    snapshot.mapping)
-    game._xdotool("mouseup", "1")
+    game.slow_click(ox + end[0], oy + end[1], snapshot.mapping)          # 2: the end point: fire
 
 
 BEAM_DRAG = 90                            # pixels (about 2.5 tiles) from the press point
-VERIFY_WAIT = 0.06                        # after an input, before reading its result (FTL: ~9 ms a frame)
+VERIFY_WAIT = 0.1                         # after an input, before reading its result (0.06 caused false misses)
 HOVER_WAIT = 0.05                         # after a hover, before reading what the game sees under it
 SYSTEM_OF_KEY = {"start_hacking": "hacking", "send_tele": "teleporter", "ret_tele": "teleporter", "mind": "mind"}
 
@@ -969,6 +1086,9 @@ def system_target(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot,
                 break
         else:
             game.cancel_aim()
+            gone = enemy_gone(proc)
+            if gone:
+                return False, f"stale: {gone}; cancelled"
             return False, f"room {room.room_id} not found under the mouse; cancelled"
     else:
         ox, oy = snapshot.player_origin
@@ -982,6 +1102,21 @@ def system_target(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot,
         return True, "ok"
     game.cancel_aim()
     return False, "nothing changed (not ready?); cancelled"
+
+
+def enemy_gone(proc) -> str | None:
+    """Why the enemy ship can no longer be clicked (a fresh read), or None. Intents are decided
+    on one snapshot and run one after another, so the enemy may blow up, surrender (its dialog
+    takes the mouse) or cloak before the last of them."""
+    now = read_snapshot(proc)
+    enemy = now.enemy
+    if now.event_open:
+        return "a dialog opened"
+    if enemy is None or enemy.destroyed or enemy.hull <= 0:
+        return "the enemy ship is gone"
+    if enemy.systems.get("cloaking") is not None and enemy.systems["cloaking"].special.get("on"):
+        return "the enemy cloaked"
+    return None
 
 
 def aim_weapon(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live: bool) -> tuple[bool, str | None]:
@@ -1014,7 +1149,52 @@ def aim_weapon(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, li
                 game.slow_click(ox + x, oy + y, snapshot.mapping)
             return True, None
     game.cancel_aim()
+    gone = enemy_gone(proc)
+    if gone:
+        return False, f"stale: {gone}; cancelled"
     return False, f"room {room.room_id} not found under the mouse (the game saw room {seen}); cancelled"
+
+
+def fire_volley(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live: bool) -> tuple[bool, str | None]:
+    """Aim several charged weapons while the game is paused, then resume: they fire in the
+    same frame, so the shields (and a defense drone) cannot take the shots one at a time.
+    The pause is always undone (it is only the bot's if the game was running before)."""
+    subs = [Intent(kind="target", weapon_index=i, room=room, reason=label) for i, room, label in intent.targets]
+    if not live:
+        for sub in subs:
+            execute(sub, game, proc, snapshot, live)
+        return True, None
+    paused_by_us, notes, aimed = False, [], 0
+    was_paused = read_snapshot(proc).paused
+    try:
+        if not was_paused:
+            game.press("pause", snapshot)
+            time.sleep(VERIFY_WAIT)
+            paused_by_us = read_snapshot(proc).paused
+        for sub in subs:
+            done, note = execute(sub, game, proc, snapshot, live)
+            aimed += bool(done)
+            if not done:
+                notes.append(f"{snapshot.player.weapons[sub.weapon_index].blueprint}: {note}")
+                if note and note.startswith("stale"):
+                    break
+    finally:
+        if paused_by_us:
+            for _ in range(3):
+                try:
+                    game.press("pause", snapshot)
+                except FocusLost:
+                    break
+                time.sleep(VERIFY_WAIT)
+                if not read_snapshot(proc).paused:
+                    break
+    how = (" (aimed while paused)" if paused_by_us or was_paused
+           else " (the game would not pause: aimed back to back)")
+    if aimed == len(subs):
+        return True, f"ok: {aimed} weapons fired together{how}"
+    if notes and all(n.split(": ", 1)[1].startswith("stale") for n in notes) and aimed == 0:
+        return False, notes[0].split(": ", 1)[1]
+    return aimed > 0, f"{aimed}/{len(subs)} aimed{how}; " + "; ".join(notes)
 
 
 def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live: bool) -> tuple[bool, str | None]:
@@ -1034,13 +1214,17 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
         return done, None
     if intent.kind == "target":
         before = snapshot.player.weapons[intent.weapon_index] if intent.weapon_index < len(snapshot.player.weapons) else None
-        done, note = aim_weapon(intent, game, proc, snapshot, live)
-        if not (done and live):
-            return done, note
-        time.sleep(VERIFY_WAIT)
-        if weapon_armed(proc):
+        for attempt in range(2):                 # a click FTL missed gets one immediate retry
+            done, note = aim_weapon(intent, game, proc, snapshot, live)
+            if not (done and live):
+                return done, note
+            time.sleep(VERIFY_WAIT)
+            if not weapon_armed(proc):
+                break
             game.cancel_aim()
-            return False, "a weapon was left armed; cancelled it"
+            time.sleep(VERIFY_WAIT)
+        else:
+            return False, "a weapon was left armed twice; cancelled it"
         # ProjectileFactory::Fire stores the target (targets, fireWhenReady) even while the
         # weapon charges; no target and no shot means the click did not register.
         weapons = read_snapshot(proc).player.weapons
@@ -1049,6 +1233,8 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
         if after is not None and not after.targeted and not fired:
             return False, "aim did not stick (the weapon has no target)"
         return True, None
+    if intent.kind == "volley":
+        return fire_volley(intent, game, proc, snapshot, live)
     if intent.kind == "system_target":
         return system_target(intent, game, proc, snapshot, live)
     if intent.kind == "system_key":
@@ -1070,6 +1256,23 @@ def execute(intent: Intent, game: GameInput, proc, snapshot: GameSnapshot, live:
         return game.press("lockdown", snapshot), None
     if intent.kind == "cloak":
         return game.press("activate_cloak", snapshot), None
+    if intent.kind == "unpower_weapon":
+        if live and weapon_armed(proc):
+            game.cancel_aim()                # Shift+key on an armed weapon only re-arms it
+            time.sleep(VERIFY_WAIT)
+        off = False
+        for attempt in range(2):             # a missed Shift gets one more try
+            done = game.press(f"weapon{intent.weapon_index + 1}", snapshot, shift=True)   # Shift+key powers it down
+            if not (done and live):
+                return done, None
+            time.sleep(VERIFY_WAIT * (attempt + 1))
+            weapons = read_snapshot(proc).player.weapons
+            off = intent.weapon_index < len(weapons) and not weapons[intent.weapon_index].powered
+            if weapon_armed(proc):
+                game.cancel_aim()
+            if off:
+                break
+        return off, ("ok: powered down" if off else "still powered")
     if intent.kind == "unpower_drone":
         done = game.press(f"drone{intent.weapon_index + 1}", snapshot, shift=True)   # Shift+key powers it down
         if done and live:
@@ -1181,6 +1384,7 @@ def main():
     shops = ShopPilot(game, proc, args.live)
     upgrades = UpgradePilot(game, proc, args.live)
     equip = EquipmentPilot(game, proc, args.live)
+    crew_pilot = CrewPilot(game, proc, args.live)
     restarter = RestartPilot(game, proc, args.live)
     mode = "LIVE" if args.live else "DRY RUN"
     print(f"[bot] {mode}: connected to FTL PID {proc.pid}. Ctrl-C to stop.")
@@ -1341,7 +1545,18 @@ def main():
                 # everything in auto-play: close it after a moment; the extra item stays behind.
                 if snapshot.ship_screen_open and may_act and not upgrades.visiting and not equip.visiting:
                     foreign_screen_since = foreign_screen_since or now
-                    if equip.pending(snapshot):
+                    if crew_pilot.pending(snapshot):
+                        # Too many crew: FTL will not close the screen until someone leaves.
+                        try:
+                            for line in crew_pilot.step(snapshot):
+                                print(line)
+                        except FocusLost:
+                            pass
+                        except (MemoryReadError, AttributeError, IndexError, KeyError, TypeError, struct.error) as error:
+                            print(f"[bot] crew over capacity: failed ({error})")
+                            crew_pilot.retry_after = time.monotonic() + 30
+                        game.drain_log()
+                    elif equip.pending(snapshot):
                         # A reward that does not fit: keep the best items, then close.
                         try:
                             for line in equip.step(snapshot):
@@ -1481,16 +1696,32 @@ def main():
                         done, result = False, "FTL lost focus; stopped"
                     except (MemoryReadError, AttributeError, IndexError) as error:
                         done, result = False, f"could not check result: {error}"
+                    if not done and args.live and result and not result.startswith("stale"):
+                        # A fight that ends opens its reward or surrender dialog, which takes the
+                        # keys and the mouse: the rest of this batch was decided for a fight
+                        # that changed.
+                        try:
+                            if ui_blocks_actions(read_snapshot(proc)):
+                                result = f"stale: a dialog opened ({result})"
+                        except (MemoryReadError, AttributeError, IndexError):
+                            pass
                     if not done and intent.crew is not None:
-                        brain.forget(intent.crew.address)
+                        brain.forget(intent.crew.address, intent.room.room_id if intent.room is not None else None)
+                    if not done and intent.kind in ("power_system", "depower_system") and intent.system and args.live:
+                        brain.power_failed(intent.system)
                     if not done and intent.door is not None and args.live:
                         brain.door_failed(intent.door.address)
+                    if (not done and args.live and intent.room is not None and result
+                            and "not found under the mouse" in result and intent.kind in ("target", "system_target")):
+                        brain.aim_failed(intent.room.room_id)
                     print(f"[bot] {intent.kind}: {intent.reason}"
                           + (f" -> {result}" if result else ("" if done else " [not executed]")))
                     if not args.live:
                         for line in game.drain_log():
                             print(f"        would run: {line}")
                     game.drain_log()
+                    if result and result.startswith("stale"):
+                        break                       # the rest was decided for a fight that changed
 
             time.sleep(max(0.0, 1.0 / args.hz - (time.monotonic() - now)))
         print("[bot] FTL exited.")

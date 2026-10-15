@@ -65,6 +65,13 @@ def _read_box(proc: FTLProcess, address: int) -> StoreItem:
     view = proc.view(address, L.StoreBox.SIZE)
     kind = L.STORE_BOX_VTABLES.get(view.ptr(0), "unknown")
     blueprint = view.ptr(L.StoreBox.BLUEPRINT)
+    item_name = ""
+    if kind == "item":
+        # Fuel, missiles and drone parts: FTL's ItemBlueprint has an empty name, so they were
+        # never recognised (or bought). The box's button image names the item instead:
+        # "storeUI/store_items_fuel" / "_missiles" / "_drones".
+        image = proc.string(address + L.StoreBox.BUTTON_IMAGE)
+        item_name = image.rsplit("_", 1)[-1] if image.startswith("storeUI/store_items_") else ""
     button = L.StoreBox.BUTTON
     rect = struct.unpack_from("<iiii", view.data, button + L.GenericButton.HITBOX)
     cost = view.i32(L.StoreBox.COST)
@@ -75,7 +82,7 @@ def _read_box(proc: FTLProcess, address: int) -> StoreItem:
     return StoreItem(
         address=address,
         kind=kind,
-        name=proc.string(blueprint + L.Blueprint.NAME) if blueprint else kind,
+        name=item_name or (proc.string(blueprint + L.Blueprint.NAME) if blueprint else kind),
         cost=cost,
         count=view.i32(L.StoreBox.COUNT),
         rect=rect,

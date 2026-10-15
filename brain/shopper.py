@@ -141,8 +141,13 @@ def _build_values(store: StoreState, snapshot: GameSnapshot, equipment=None) -> 
             if key in player.systems:
                 continue
             if key == "drones":
-                # Only worth it with a good drone to put in it (bought next, from this store).
-                value = best_drone * 0.9 if best_drone >= 80 else 25
+                # Only worth it with a good drone to put in it, bought next from this store, so
+                # only when the scrap covers both (seen: Drone Control bought with 2 scrap left
+                # and the Defense Drone beside it unaffordable: 85 scrap wasted).
+                drone_costs = [i.cost for i in store.items if i.kind == "drone" and i.count != 0
+                               and DRONE_VALUE.get(i.stats.get("type", ""), 0) >= 80]
+                affordable = drone_costs and player.scrap >= item.cost + min(drone_costs)
+                value = best_drone * 0.9 if best_drone >= 80 and affordable else 0
             else:
                 value = SYSTEM_VALUE.get(key, 30)
             out.append((item, value, f"system {name}"))

@@ -224,6 +224,25 @@ def choose_boss_route(state: StarMapState, snapshot: GameSnapshot, beacon_value)
         + (" - next jump meets it" if jumps == 1 else "")])
 
 
+def _nearest_store(state: StarMapState, start: int, max_jumps: int) -> list[int] | None:
+    """Shortest path (addresses after start) to a store beacon the fleet has not taken."""
+    seen = {start: [start]}
+    frontier = [start]
+    for _ in range(max(0, max_jumps)):
+        nxt = []
+        for address in frontier:
+            for other in state.beacons[address].connected:
+                beacon = state.beacons.get(other)
+                if beacon is None or other in seen or beacon.overtaken:
+                    continue
+                seen[other] = seen[address] + [other]
+                if beacon.store:
+                    return seen[other][1:]
+                nxt.append(other)
+        frontier = nxt
+    return None
+
+
 def choose_destination(state: StarMapState, snapshot: GameSnapshot, beacon_value) -> Plan | None:
     """beacon_value(beacon) -> (event value, has environment hazard) for an unvisited beacon."""
     player = snapshot.player
@@ -298,6 +317,14 @@ def choose_destination(state: StarMapState, snapshot: GameSnapshot, beacon_value
             return Plan(beacon=None, score=LEAVE_SECTOR_BONUS, leave_sector=True,
                         notes=["at the exit", "no route here is worth more than moving on"])
 
+    if best[1] is None and player.fuel < to_exit.get(current.address, 99):
+        # Not enough fuel for the exit: a store within reach sells fuel (seen: a run stranded at
+        # 0 fuel two jumps from the exit after heading for it with 1).
+        path = _nearest_store(state, current.address, player.fuel)
+        if path:
+            return Plan(beacon=beacons[path[0]], score=0.0, notes=[
+                f"fuel {player.fuel} is not enough for the exit ({to_exit.get(current.address, '?')} jumps): "
+                f"to a store {len(path)} jump(s) away for fuel"])
     if best[1] is None:
         # No safe route to the exit: run for it through whatever is closest to the exit.
         options = [beacons[a] for a in current.connected if a in beacons and a in to_exit]

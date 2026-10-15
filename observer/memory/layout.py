@@ -361,6 +361,7 @@ class CommandGui:              # size 0x4798                                 DWA
     MENU_PAUSE = 0x318A        # bool menu_pause
     EVENT_PAUSE = 0x318B       # bool event_pause
     SHIP_SCREENS = 0x3200      # TabbedWindow (upgrades / crew / equipment)
+    CREW_SCREEN = 0x37D0       # CrewManifest                                                      DWARF
     EQUIP_SCREEN = 0x3C00      # Equipment (the ship screen's third tab, and the store's Sell tab)  DWARF
     STORE_SCREENS = 0x3380     # TabbedWindow
     UPGRADE_BUTTON = 0x3F48    # Button on the HUD; LButtonDown opens SHIP_SCREENS when hovered  REA
@@ -459,6 +460,16 @@ class Equipment:               # size 0x338, derives FocusWindow (CommandGui.equ
     STORE_MODE = 0x32A         # bool: shown as the store's Sell tab
 
 
+class CrewManifest:            # size 0x430, derives FocusWindow (the ship screen's crew tab)  DWARF
+    BOXES = 0xB8               # vector<CrewEquipBox*>; a box's crew is EquipmentBox.ITEM + 0x10
+    CONFIRMING_DELETE = 0x1A8  # int
+    DELETE_DIALOG = 0x1B0      # ConfirmWindow: FocusWindow (bOpen +0x8), yesButton +0x78
+
+
+class CrewEquipBox:            # derives EquipmentBox                          DWARF
+    DELETE_BUTTON = 0xB8       # TextButton "Dismiss" (a GenericButton)
+
+
 class EquipmentBox:            # size 0xA8                                   DWARF
     SIZE = 0xA8
     LOCATION = 0x58            # Point
@@ -485,6 +496,7 @@ class TabbedWindow:            # size 0x180, derives FocusWindow             DWA
     BUTTONS = 0x20             # vector<Button*>: one tab button per window
     WINDOWS = 0x38             # vector<FocusWindow*>; the ship screen's first window is Upgrades
     CURRENT_TAB = 0x68         # unsigned int
+    BLOCK_CLOSE = 0x178        # bool: the window cannot be closed yet (e.g. crew over capacity)
 
 
 class Upgrades:                # size 0x2D0, derives FocusWindow             DWARF
@@ -535,6 +547,7 @@ class StoreBox:                # size 0x140 (+ subclass fields)              DWA
     BLUEPRINT = 0x128          # const Blueprint*: name at +0x8
     REPAIR_ALL = 0x140         # RepairStoreBox: bool
     REPAIR_COST = 0x144        # RepairStoreBox: int
+    BUTTON_IMAGE = 0x10        # std::string: e.g. "storeUI/store_items_fuel" (item boxes: the only place their item is named)
 
 
 # Store box vtables (vptr = vtable + 0x10) identify the kind of box.         nm

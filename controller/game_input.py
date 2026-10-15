@@ -242,7 +242,7 @@ class GameInput:
     # FTL picks up pointer motion once per frame. A click sent right after a move is
     # handled at the old position (seen in calibration: orders landed in the last
     # hovered room), so wait for the move to complete and give the game a few frames.
-    SETTLE_SECONDS = 0.045
+    SETTLE_SECONDS = 0.06
     PRESS_SECONDS = 0.015              # between a key / button going down and up again
 
     def _move(self, wx: int, wy: int):
@@ -285,10 +285,10 @@ class GameInput:
         self.hover(game_x + 3, game_y + 3, mapping)
         self.hover(game_x, game_y, mapping)
         if not self.dry_run:
-            time.sleep(0.05)
+            time.sleep(0.1)                 # (halving these doubled "weapon left armed" misses)
         self._xdotool("mousedown", "1")
         if not self.dry_run:
-            time.sleep(0.04)
+            time.sleep(0.08)
         self._xdotool("mouseup", "1")
         if not self.dry_run:
             time.sleep(self.SETTLE_SECONDS)

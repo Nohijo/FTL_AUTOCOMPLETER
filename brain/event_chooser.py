@@ -18,6 +18,7 @@ SCRAP = 1.0
 FUEL, MISSILE, DRONE_PART = 3.0, 3.0, 3.0
 LOW_FUEL, LOW_MISSILES = 3, 2             # below these, those resources are worth more
 SCARCE_MULTIPLIER = 3.0
+STRANDED_FUEL = 40.0                      # each of the first fuel units when the tank is (almost) empty
 CREW = 45.0
 ITEM_VALUE_OF_COST = 0.6                  # weapons / drones / augments: 60% of store price
 ITEM_UNKNOWN_COST = 40.0
@@ -35,6 +36,7 @@ FIGHT_SCRAP_BASE, FIGHT_SCRAP_PER_SECTOR = 15.0, 5.0
 STORE = 8.0
 LOW_HULL_FIGHT = 30.0                     # extra risk of an optional fight below 30% hull
 HAZARD_FIGHT = 8.0                        # extra risk of fighting in a hazard
+LAST_STAND_FIGHT = 100.0                  # sector 8: any fight but the Flagship's costs hull and time the chase needs
 REPAIR_PER_HULL = 2.0
 
 # Status effects (e.g. "engines and shields halved"): value of one bar of a system, mostly
@@ -121,13 +123,30 @@ def _items(res: Resources, ship: ShipInfo | None = None) -> list[tuple[str, floa
     return found
 
 
+MAX_CREW = 8
+
+
+def _crew_value(ship: ShipInfo, change: int) -> float:
+    """A crew member is worth CREW while there is room; with every place taken a new one only
+    forces someone out (FTL blocks the ship screen until one is dismissed)."""
+    if change > 0 and _own_crew(ship) >= MAX_CREW:
+        return 0.0
+    return CREW
+
+
 def _resources_value(res: Resources, ship: ShipInfo, notes: list[str], label: str = "") -> float:
     fuel_weight = FUEL * (SCARCE_MULTIPLIER if ship.fuel <= LOW_FUEL else 1)
     missile_weight = MISSILE * (SCARCE_MULTIPLIER if ship.missiles <= LOW_MISSILES else 1)
     hull_weight = HULL_POINT_WHEN_LOW if ship.hull < 0.4 * ship.max_hull else HULL_POINT
 
-    value = (res.scrap * SCRAP + res.fuel * fuel_weight + res.missiles * missile_weight
-             + res.drones * DRONE_PART + res.crew * CREW - res.hull_damage * hull_weight)
+    fuel_value = res.fuel * fuel_weight
+    if res.fuel > 0 and ship.fuel <= 1:
+        # Out of fuel the ship is stranded until the rebel fleet arrives (seen: a run lost after
+        # turning down "15 scrap for 5 fuel"). The first jumps' worth of fuel is worth nearly anything.
+        first = min(res.fuel, 3 - ship.fuel)
+        fuel_value = first * STRANDED_FUEL + (res.fuel - first) * fuel_weight
+    value = (res.scrap * SCRAP + fuel_value + res.missiles * missile_weight
+             + res.drones * DRONE_PART + res.crew * _crew_value(ship, res.crew) - res.hull_damage * hull_weight)
     for name, amount in (("scrap", res.scrap), ("fuel", res.fuel), ("missiles", res.missiles),
                          ("drone parts", res.drones), ("crew", res.crew)):
         if amount:
@@ -193,6 +212,9 @@ def outcome_value(outcome: Outcome | None, ship: ShipInfo, notes: list[str], sec
             risk += LOW_HULL_FIGHT / 2
         if outcome.environment:
             risk += HAZARD_FIGHT         # fighting next to a sun, in asteroids, a storm...
+        if sector >= 8 and not (outcome.ship_name or "").startswith("BOSS"):
+            risk += LAST_STAND_FIGHT     # the Last Stand: follow the Flagship, no side fights
+            notes.append("side fight in the Last Stand")
         reward_notes: list[str] = []
         reward = _resources_value(outcome.reward, ship, reward_notes)
         if not reward_notes:

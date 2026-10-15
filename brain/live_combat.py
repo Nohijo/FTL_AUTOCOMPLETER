@@ -66,6 +66,9 @@ SPECIALISTS = {
 SEND_TO_MEDBAY = 0.40
 NANO_MEDBAY_TRIP = 0.25
 FIRE_RETREAT = 0.6
+FIRE_FIT = 0.75                    # only crew this healthy go into a fire (well above FIRE_RETREAT: no recall loop)
+BIG_FIRE = 3                       # fire tiles from which a room is fought by a team that goes together, never one alone
+OUTNUMBERED_RETREAT = 0.6          # leave a fight outside the medbay below this when boarders outnumber us there
 VENT_MIN_SHIP_AIR = 0.4
 VENT_GIVE_UP_SECONDS = 25.0       # a vented room still burning after this long: crew / drone take over
 STARVE_MIN_AIR = 0.55             # cut the oxygen supply against fires only above this much ship air...
@@ -74,6 +77,8 @@ STARVE_MAX_SECONDS = 30.0           # no fire venting while the whole ship has l
 SEND_TO_MEDBAY_AT_PEACE = 0.85   # outside combat healing is free, so top everyone up
 HEALED = 0.90
 FIT_FOR_DUTY = 0.40
+AIR_CRISIS = 0.50                  # ship air below this with the oxygen system broken: fixing it beats healing
+AIR_CRISIS_MEDBAY = 0.20           # ...and only crew below this much health go to (or stay in) the medbay
 
 REISSUE_TARGET_SECONDS = 0.5
 VOLLEY_WINDOW_SECONDS = 1.0
@@ -91,12 +96,18 @@ BATTERY_RETRY_SECONDS = 10.0
 DEADLOCK_SECONDS = 45.0          # no enemy hull damage for this long in a fight -> leave
 DRONE_HULL_REPAIR = 0.7           # launch a hull repair drone below this much hull
 FIGHT_MARGIN = 1.3
+AIM_RETRY_SECONDS = 10.0           # an enemy room the game would not register under the mouse is skipped this long
+DRONE_AIRLESS_WAIT = 8.0           # a boarding drone in an airless room is fought anyway after this long (if we are stronger)
+DRONE_HOLD_MAX = 15.0              # waiting on a boarding drone at most this long before reassessing with a lower bar
+DRONE_AIRLESS_FIT = 0.8            # crew this healthy may go into an airless room for a short fight with a drone
 FIGHT_HOLD = 0.9                   # keep fighting until our side drops below this ratio
+BOARD_ENGAGE_MARGIN = 2.0          # go into a boarded room only this much stronger (else hold the medbay)
+BOARDER_FIT = 0.6                  # crew below this much health fight boarders only in the medbay
 BOARDER_WEAKEN_TO = 0.5            # vent a boarded room until the boarders are down to this much health...
 BOARDER_VENT_GIVE_UP = 30.0        # ...or for at most this long (they keep the air up, e.g. a door held open)
 BOARDER_AIR_WEAK = 30.0            # room oxygen (%) below which breathing boarders are losing health
 BOARD_PLAN_DWELL = 6.0             # keep a room's plan (vent / engage / hold) at least this long                 # fight boarders head-on when this much stronger
-SPECIES_FIGHT = {"mantis": 1.5, "rock": 1.0, "crystal": 1.1, "engi": 0.5, "zoltan": 0.9,
+SPECIES_FIGHT = {"mantis": 1.5, "rock": 1.0, "crystal": 1.1, "engi": 0.5, "zoltan": 0.9, "energy": 0.9,
                  "slug": 1.0, "human": 1.0, "lanius": 1.0, "anaerobic": 1.0}
 CREW_AIR_DANGER = 25.0             # room oxygen (%): crew in a room with less air than this -> close every door
 VENT_HOLD_SECONDS = 20.0           # after such an emergency, no venting for this long
@@ -106,6 +117,8 @@ POWERED_SYSTEMS = ("shields", "engines", "oxygen", "weapons", "drones", "medbay"
                    "cloaking", "hacking", "mind", "teleporter")
 AIR_TOP_UP = 95.0                # room oxygen (%) below this makes air the first system to power
 REISSUE_CREW_SECONDS = 2.5
+ORDER_BACKOFF_SECONDS = 15.0       # a crew order the game refused is not repeated for this long
+POWER_BACKOFF_SECONDS = 20.0       # nor a power change that did not take
 REISSUE_ALERT_SECONDS = 30.0
 
 
@@ -120,6 +133,7 @@ class Intent:
     door: DoorInfo | None = None      # for "door"
     want_open: bool = False
     on_enemy: bool = True             # "system_target": click the room on the enemy ship (else ours)
+    targets: list | None = None       # "volley": [(weapon index, room, label), ...] aimed in one pause
 
 
 def ui_blocks_actions(snapshot: GameSnapshot) -> bool:
@@ -131,8 +145,17 @@ def fire_immune(crew: CrewInfo) -> bool:
     return crew.species.lower() == "rock"
 
 
+DRONE_SPECIES = ("battle", "repair")   # boarding / anti-personnel drones, repair drones (CrewDrone species)
+
+
+def is_drone(crew: CrewInfo) -> bool:
+    return crew.species.lower() in DRONE_SPECIES or "drone" in f"{crew.name} {crew.species}".lower()
+
+
 def breathes_nothing(crew: CrewInfo) -> bool:
-    return crew.species.lower() == "anaerobic"      # Lanius
+    """Lanius and drones: venting their room does not hurt them (a boarding drone in a
+    vented room was left alone, 'they suffocate', while it wrecked the ship)."""
+    return crew.species.lower() == "anaerobic" or is_drone(crew)
 
 
 def enemy_has_defense_drone(snapshot: GameSnapshot) -> bool:
@@ -196,19 +219,45 @@ class LiveCombatBrain:
         self.failed_doors: dict[int, float] = {}
         # while boarders are aboard: crew address -> room they hold (helm, doors, medbay)
         self.boarding_posts: dict[int, int] = {}
+        self.boarding_mode: str | None = None
+        self.refused_orders: dict[tuple[int, int], float] = {}   # (crew, room) -> when FTL refused it
+        self.refused_power: dict[str, float] = {}                # system -> when a power change failed
         # boarded room -> "engage" / "vent" / "hold" (_assess_boarders), and when venting it began
         self.boarder_plans: dict[int, str] = {}
         self.vent_started_boarders: dict[int, float] = {}
         self.now = 0.0
+
+    def aim_failed(self, room_id: int):
+        """The game would not register the mouse over this enemy room (seen: every spot of one
+        room read as its neighbour, re-aimed four times in two seconds): aim elsewhere for a while."""
+        self.failed_aims = getattr(self, "failed_aims", {})
+        self.failed_aims[room_id] = self.now
+        held = getattr(self, "held_target", None)
+        if held and held[1].room_id == room_id:
+            self.held_target = None
+
+    def _aim_blocked(self, room_id: int) -> bool:
+        return self.now - getattr(self, "failed_aims", {}).get(room_id, -1e9) < AIM_RETRY_SECONDS
 
     def door_failed(self, door_address: int):
         """The game did not accept a door click; stop relying on venting through it for a while."""
         self.failed_doors[door_address] = self.now
         self.opened_doors.discard(door_address)
 
-    def forget(self, crew_address: int):
-        """Drop an assignment, e.g. when the game did not accept the order."""
+    def forget(self, crew_address: int, room_id: int | None = None):
+        """Drop an assignment, e.g. when the game did not accept the order. A refused order is
+        not repeated for a while (seen: the same refused order every 2 s for a minute)."""
         self.assignments.pop(crew_address, None)
+        if room_id is not None:
+            self.refused_orders[(crew_address, room_id)] = self.now
+
+    def power_failed(self, system: str):
+        """The game did not take a power change for this system: leave it alone for a while
+        (seen: "powering engines -> power did not change" every second for minutes)."""
+        self.refused_power[system] = self.now
+
+    def _refused(self, crew_address: int, room_id: int) -> bool:
+        return self.now - self.refused_orders.get((crew_address, room_id), -1e9) < ORDER_BACKOFF_SECONDS
 
     def _due(self, key: tuple, now: float, interval: float) -> bool:
         if now - self.last_issued.get(key, -math.inf) < interval:
@@ -246,6 +295,8 @@ class LiveCombatBrain:
         intents += self._deploy_drones(snapshot, now)
         if in_combat(snapshot):
             intents += self._power_weapons(snapshot, now)
+            # (a weapon losing its power in this decision is not aimed in it too)
+            self.unpowering = {i.weapon_index for i in intents if i.kind == "unpower_weapon"}
             intents += self._attack(snapshot, now)
             intents += self._cloak(snapshot, now)
             intents += self._hacking(snapshot, now)
@@ -414,9 +465,12 @@ class LiveCombatBrain:
         self.power_plan = plan
         spare = self._spare_power(player)
         intents = []
+        def backing_off(name: str) -> bool:
+            return self.now - self.refused_power.get(name, -1e9) < POWER_BACKOFF_SECONDS
+
         for name, target in plan.items():
             system = player.systems[name]
-            if system.ion_lock or system.power <= target:
+            if system.ion_lock or system.power <= target or backing_off(name):
                 continue
             if self._due(("depower", name), now, REISSUE_POWER_SECONDS):
                 intents.append(Intent(kind="depower_system", system=name,
@@ -424,7 +478,7 @@ class LiveCombatBrain:
                 spare += 1
         for name, target in plan.items():
             system = player.systems[name]
-            if name in ("weapons", "drones") or system.ion_lock or system.power >= target:
+            if name in ("weapons", "drones") or system.ion_lock or system.power >= target or backing_off(name):
                 continue
             step = 2 if name == "shields" else 1      # a shield key press adds a whole layer
             if spare < step or not self._due(("power", name), now, REISSUE_POWER_SECONDS):
@@ -580,6 +634,19 @@ class LiveCombatBrain:
                            reason=f"teleporter: {', '.join(c.name for c in party)} into the Flagship's "
                                   f"{pod.label} (room {pod.room.room_id}) to wreck it")]
         return []
+
+    def _room_full(self, snapshot: GameSnapshot, room: RoomInfo, crew: CrewInfo) -> bool:
+        """Every tile of the room is taken by others (in it or on their way): FTL refuses
+        the order (seen: "back to their station (pilot)" resent every 2 s into a full cockpit)."""
+        others = sum(1 for c in self._own_crew(snapshot) if c.address != crew.address and heading_to(c, room))
+        others += sum(1 for c in self._intruders(snapshot) if c.room_id == room.room_id)
+        return others >= room_capacity(snapshot, room)
+
+    def _airless(self, room: RoomInfo | None) -> bool:
+        """A room crew who breathe must not be sent into: being vented, or nearly out of air
+        (seen: crew sent 'back to their station' in a room just vented, and suffocating)."""
+        return room is not None and (room.room_id in self.vented_rooms
+                                     or (room.oxygen is not None and room.oxygen < CREW_AIR_DANGER))
 
     def _turncoats(self, snapshot: GameSnapshot) -> list[CrewInfo]:
         """Our own crew under enemy mind control (they fight us for a while, then come back)."""
@@ -756,36 +823,61 @@ class LiveCombatBrain:
     # --- offence -------------------------------------------------------------
 
     def _power_weapons(self, snapshot: GameSnapshot, now: float) -> list[Intent]:
-        """Press the hotkey of each unpowered weapon. WeaponControl::SelectArmament powers an
-        unpowered weapon when the weapon system and reactor have room for it."""
+        """Give the weapon bars to the weapons that will fire: guns that need no ammunition
+        first (lasers, beams, ion, flak), then missile launchers and bombs with what is left.
+        The weapon hotkey powers an unpowered weapon (WeaponControl::SelectArmament); with
+        Shift it takes the power away (ArmamentControl::KeyDown). Seen: a bomb holding the
+        last bar while the burst laser stayed dark and missiles were being saved, so nothing
+        fired at all for a whole fight."""
         player = snapshot.player
         weapons_system = player.systems.get("weapons")
         if weapons_system is None or weapons_system.ion_lock:
             return []
-        spare_system = weapons_system.health - weapons_system.power
-        spare_reactor = self._spare_power(player)
-        spare_reactor -= getattr(self, "power_claimed", 0)     # bars _manage_power just gave to shields/air
+        weapons = player.weapons[:4]
 
+        def ammo(w) -> bool:
+            return w.missiles_per_shot > 0
+
+        def wanted(w) -> bool:
+            if w.stats and arsenal.kind(w.stats) == "heal":
+                return False                     # a healing bomb is not fired in fights
+            return not ammo(w) or player.missiles >= w.missiles_per_shot
+
+        claimed = getattr(self, "power_claimed", 0)     # bars _manage_power just gave to shields/air
+        held = sum(w.required_power for w in weapons if w.powered)
+        budget = min(min(weapons_system.level, weapons_system.health),
+                     self._spare_power(player) - claimed + held)
+        want: set[int] = set()
+        for i in sorted(range(len(weapons)), key=lambda i: (ammo(weapons[i]), i)):
+            if wanted(weapons[i]) and weapons[i].required_power <= budget:
+                want.add(i)
+                budget -= weapons[i].required_power
+        need = [i for i in sorted(want) if not weapons[i].powered]
+        spare_system = weapons_system.health - weapons_system.power
+        spare_reactor = self._spare_power(player) - claimed
         intents = []
-        for index, weapon in enumerate(player.weapons[:4]):
-            if weapon.powered or (weapon.stats and arsenal.kind(weapon.stats) == "heal"):
-                continue                     # a healing bomb is not fired in fights: no power for it
-            if weapon.required_power > min(spare_system, spare_reactor):
+        for i in need:
+            w = weapons[i]
+            if w.required_power <= min(spare_system, spare_reactor):
+                if self._due(("power", i), now, REISSUE_POWER_SECONDS):
+                    spare_system -= w.required_power
+                    spare_reactor -= w.required_power
+                    intents.append(Intent(kind="power_weapon", weapon_index=i,
+                                          reason=f"powering {w.blueprint} ({w.required_power} power)"))
                 continue
-            if weapon.missiles_per_shot > player.missiles:
-                continue
-            if self._due(("power", index), now, REISSUE_POWER_SECONDS):
-                spare_system -= weapon.required_power
-                spare_reactor -= weapon.required_power
-                intents.append(Intent(kind="power_weapon", weapon_index=index,
-                                      reason=f"powering {weapon.blueprint} ({weapon.required_power} power)"))
+            # It does not fit: free bars held by a weapon that is not part of the plan.
+            extra = [j for j, other in enumerate(weapons) if other.powered and j not in want]
+            if extra and self._due(("unpower_weapon", extra[0]), now, REISSUE_POWER_SECONDS):
+                intents.append(Intent(kind="unpower_weapon", weapon_index=extra[0],
+                                      reason=f"taking power from {weapons[extra[0]].blueprint} for {w.blueprint}"))
+            break
         return intents
 
     def _pick_target_room(self, snapshot: GameSnapshot, order: list[str]) -> tuple[str, RoomInfo] | None:
         enemy = snapshot.enemy
         for name in order:
             system = enemy.systems.get(name)
-            if system is None or system.health <= 0:
+            if system is None or system.health <= 0 or self._aim_blocked(system.room_id):
                 continue
             room = _room(enemy.rooms, system.room_id)
             if room is not None:
@@ -802,11 +894,15 @@ class LiveCombatBrain:
         defended = not has_augment(player, "DEFENSE_SCRAMBLER") and (drone_system is not None and drone_system.health > 0
                     and any(d.kind == "DEFENSE" and d.active for d in enemy.drones))
         order: list[str] = []
+        # Boarding drones die with the drone control that launched them: aim there first.
+        drones_aboard = (drone_system is not None and drone_system.health > 0
+                         and any(is_drone(c) for c in self._intruders(snapshot)))
         if boss:
             # The Flagship: its weapon pods first, most dangerous to this ship first
             # (brain/flagship.py), then the systems of the stage. Missiles are for this fight.
             launchers_mounted = any(w.missiles_per_shot > 0 for w in player.weapons)
-            candidates = flagship.targets(snapshot, defended, launchers_mounted)
+            candidates = flagship.targets(snapshot, defended, launchers_mounted, drones_aboard)
+            candidates = [c for c in candidates if not self._aim_blocked(c[1].room_id)] or candidates
             plan_name, use_missiles = f"flagship stage {enemy.boss_stage}", not defended
         elif escaping:
             # A ship cannot charge its FTL drive without a working helm and engines:
@@ -826,6 +922,9 @@ class LiveCombatBrain:
             if has_augment(player, "EXPLOSIVE_REPLICATOR") and player.missiles >= 2:
                 use_missiles = True      # half the shots cost nothing
 
+        if drones_aboard and not boss and not escaping:
+            order = ["drones"] + [name for name in order if name != "drones"]
+            plan_name = "kill_drone_control (boarding drone aboard)"
         target = (candidates[0] if candidates else None) if boss else self._pick_target_room(snapshot, order)
         if target is None:
             return []
@@ -855,7 +954,8 @@ class LiveCombatBrain:
         guns, launchers, beams = [], [], []
         aim: dict[int, tuple[str, RoomInfo]] = {}
         for index, weapon in enumerate(player.weapons[:4]):
-            if not weapon.powered or weapon.weapon_type in UNSUPPORTED_WEAPON_TYPES:
+            if (not weapon.powered or weapon.weapon_type in UNSUPPORTED_WEAPON_TYPES
+                    or index in getattr(self, "unpowering", ())):
                 continue
             role = self._weapon_role(snapshot, weapon, escaping)
             if role == "skip":
@@ -870,6 +970,11 @@ class LiveCombatBrain:
             else:
                 (launchers if weapon.missiles_per_shot > 0 else guns).append((index, weapon))
 
+        # Saving missiles is no reason to do nothing: with no powered gun that needs no
+        # ammunition, the launchers fire.
+        if not any(w.powered and w.missiles_per_shot == 0 and not (w.stats and arsenal.kind(w.stats) == "heal")
+                   for w in player.weapons[:4]):
+            use_missiles = True
         # A weapon aimed while still charging fires by itself the moment it is charged, so
         # weapons are aimed early instead of waiting for the bot to notice the charge.
         chosen = []
@@ -886,11 +991,18 @@ class LiveCombatBrain:
         solo = [(i, w) for i, w in guns if w.shots > layers]
         group = [(i, w) for i, w in guns if w.shots <= layers]
         chosen += solo
-        # The others only hurt as one volley (a shield layer comes back about every 2 s), so
-        # aim them together once all of them will be charged within VOLLEY_WINDOW_SECONDS.
-        if group and (escaping or not self.volley
-                      or all(w.charge_goal - w.charge <= VOLLEY_WINDOW_SECONDS for _, w in group)):
+        # The others only hurt as one volley (a shield layer comes back about every 2 s). Aimed
+        # early, each fired the moment it charged: guns with different charge times (12 s and
+        # 13 s) landed a second apart, and the Flagship's shields and defense drone took every
+        # shot (stage 2: a minute of fire, its hull untouched). So they wait until all are
+        # charged, then go as one volley: aimed while the game is paused, fired together.
+        volley = []
+        if group and (escaping or not self.volley):
             chosen += group
+        elif len(group) == 1 and group[0][1].charge_goal - group[0][1].charge <= VOLLEY_WINDOW_SECONDS:
+            chosen += group
+        elif group and all(w.ready for _, w in group):
+            volley = group
         # A beam loses one damage per shield layer it crosses and fires the moment it is aimed:
         # aim it when charged and it gets through the shields as they are now (after a volley).
         up_now = enemy.shield_layers + enemy.super_shield
@@ -913,6 +1025,15 @@ class LiveCombatBrain:
             intents.append(Intent(kind="autofire", want_open=autofire,
                                   reason=f"autofire {'on' if autofire else 'off'}: {why}"))
 
+        if volley and self._due(("volley",), now, REISSUE_TARGET_SECONDS):
+            targets = []
+            for index, weapon in volley:
+                label, where = aim.get(index, (system_name, room))
+                self.weapon_targets[index] = label
+                targets.append((index, where, label))
+            names = ", ".join(f"{w.blueprint} -> {aim.get(i, (system_name, room))[0]}" for i, w in volley)
+            intents.append(Intent(kind="volley", targets=targets,
+                                  reason=f"{plan_name}: volley of {len(volley)} ({names})"))
         for index, weapon in chosen:
             label, where = aim.get(index, (system_name, room))
             if self._due(("target", index), now, REISSUE_TARGET_SECONDS):
@@ -958,7 +1079,7 @@ class LiveCombatBrain:
         player = snapshot.player
         return [c for c in player.crew
                 if c.ship_id == player.ship_id and not c.dead and c.health > 0 and not c.intruder
-                and not c.mind_controlled and c.room_id >= 0 and "drone" not in f"{c.name} {c.species}".lower()]
+                and not c.mind_controlled and c.room_id >= 0 and not is_drone(c)]
 
     def _intruders(self, snapshot: GameSnapshot) -> list[CrewInfo]:
         """Enemy crew standing on the player ship (boarders), from either crew list."""
@@ -1019,11 +1140,19 @@ class LiveCombatBrain:
 
         new_plans: dict[int, str] = {}
         notes: dict[int, str] = {}
+        neighbours: dict[int, set[int]] = {}
+        for door in player.doors:
+            if not door.airlock:
+                neighbours.setdefault(door.room1, set()).add(door.room2)
+                neighbours.setdefault(door.room2, set()).add(door.room1)
         for room_id, group in groups.items():
             room = _room(player.rooms, room_id)
             if room is None:
                 continue
-            theirs = self._strength(group)
+            # Boarders next door join in as our crew arrive (seen: "2 there, 485 vs 200", then
+            # four of them in the room and our crew cut down one by one).
+            nearby = [c for r in neighbours.get(room_id, set()) for c in groups.get(r, [])]
+            theirs = self._strength(group) + 0.8 * self._strength(nearby)
             hp = sum(c.health for c in group) / max(1.0, sum(c.max_health for c in group))
             air = room.oxygen if room.oxygen is not None else 100.0
             breathing = all(not breathes_nothing(c) for c in group)
@@ -1039,9 +1168,23 @@ class LiveCombatBrain:
                         and bool(self._vent_path(player, room_id, no_vent)[0])
                         and now - self.vent_started_boarders.get(room_id, now) < BOARDER_VENT_GIVE_UP)
             previous = plans.get(room_id)
-            margin = FIGHT_HOLD if previous == "engage" else FIGHT_MARGIN
+            # Crew reach their room one by one and fight without the medbay's healing, so a
+            # room is only stormed with a clear edge (seen: 4 crew vs 4 Zoltans, "450 vs 280",
+            # crushed to 124 vs 167 in six seconds). Wreckers of a vital system mid-fight are
+            # met earlier.
+            margin = FIGHT_HOLD if previous == "engage" else (FIGHT_MARGIN if critical else BOARD_ENGAGE_MARGIN)
+            drones_only = all(is_drone(c) for c in group)
             if room_id in keep_rooms:
                 plan, why = "engage", f"they reached our {next(r for r, i in safe.items() if i == room_id)}"
+            elif drones_only:
+                # Count only the crew _damage_control would send (the same health bars), so
+                # the plan never says "engage" with nobody able to go.
+                heals_here = medbay_heals and room_id == medbay.room_id
+                bar = DRONE_AIRLESS_FIT if air < CREW_AIR_DANGER else (0.0 if heals_here else BOARDER_FIT)
+                fit = [c for c in fighters if breathes_nothing(c)
+                       or c.health >= bar * c.max_health][:room_capacity(snapshot, room)]
+                ours_fit = self._strength(fit) * (0.7 if air < CREW_AIR_DANGER else 1.0) * (1.5 if heals_here else 1.0)
+                plan, why = self._drone_plan(room_id, previous, since, ours_fit, theirs, fit, air, critical, system, now)
             elif breathing and air < BREATHABLE and any(not breathes_nothing(c) for c in team):
                 plan, why = ("vent" if can_vent else "hold"), f"almost no air in there ({air:.0f}%): they suffocate, we would too"
             elif can_vent and hp > BOARDER_WEAKEN_TO and not (critical and ours >= FIGHT_MARGIN * theirs):
@@ -1054,6 +1197,15 @@ class LiveCombatBrain:
                 plan, why = "hold", (f"too strong to fight ({ours:.0f} vs {theirs:.0f}) and no safe way to vent: "
                                      f"holding the medbay and the helm")
             forced = (previous == "vent" and not can_vent) or room_id in keep_rooms
+            if drones_only and plan == "engage" and room_id not in keep_rooms:
+                # An engage nobody can carry out (everyone too hurt for it) is no plan: after
+                # DRONE_HOLD_MAX with nobody heading in, back to containing it (crew heal then).
+                self.drone_idle = getattr(self, "drone_idle", {})
+                if any(heading_to(c, room) for c in own):
+                    self.drone_idle.pop(room_id, None)
+                elif now - self.drone_idle.setdefault(room_id, now) > DRONE_HOLD_MAX:
+                    self.drone_idle.pop(room_id, None)
+                    plan, why, forced = "contain", "nobody could go in after all: containing it while crew heal", True
             if previous and plan != previous and not forced and now - since.get(room_id, now) < BOARD_PLAN_DWELL:
                 plan = previous                    # no flip-flopping
             if plan != previous:
@@ -1081,15 +1233,51 @@ class LiveCombatBrain:
 
         self.boarder_plans = new_plans
         self.boarder_plan_since = {r: t for r, t in since.items() if r in new_plans}
-        mode = "fight" if new_plans and all(p == "engage" for p in new_plans.values()) else "defend"
+        self.drone_rooms = {r for r in new_plans if all(is_drone(c) for c in groups[r])}
+        self.airless_fights = {r for r in self.drone_rooms if new_plans[r] == "engage"}
+        # "contain" (a drone left alone for now) keeps everyone on duty: no posts, no venting.
+        if any(p in ("vent", "hold") for p in new_plans.values()):
+            mode = "defend"
+        elif any(p == "engage" for p in new_plans.values()):
+            mode = "fight"
+        else:
+            mode = "contain"
         previous_mode, self.boarding_mode = getattr(self, "boarding_mode", None), mode
         if mode != previous_mode:
             ours_all, theirs_all = self._strength(fighters), self._strength(boarders)
             alerts.append(Intent(kind="alert", reason=(
                 f"{len(boarders)} boarder(s): " + ("fighting them everywhere" if mode == "fight" else
+                                                   "crew stay on duty, out of the drone's room" if mode == "contain" else
                                                    "helm, doors and medbay held; vent / fight room by room")
                 + f" (our {ours_all:.0f} vs their {theirs_all:.0f})")))
         return alerts
+
+    def _drone_plan(self, room_id: int, previous: str | None, since: dict[int, float], ours: float, theirs: float,
+                    team: list[CrewInfo], air: float, critical: bool, system: str | None, now: float) -> tuple[str, str]:
+        """A room with only boarding drones in it. Drones never suffocate, so venting and
+        waiting do nothing; destroying the enemy's drone control kills them (the guns aim
+        there, _attack). Crew fight them when stronger; an airless (breached) room is
+        entered only by healthy crew once the drone wrecks a vital system there or has
+        been left alone long enough; and every wait has a limit, after which the bar to
+        fight drops: never an endless wait."""
+        waited = now - since.get(room_id, now) if previous in ("contain", "hold") else 0.0
+        airless = air < CREW_AIR_DANGER
+        margin = FIGHT_HOLD if previous == "engage" else FIGHT_MARGIN
+        where = f" on the {system}" if system else ""
+        if not team:
+            return "contain", (f"boarding drone{where}: nobody fit to fight it{' in an airless room' if airless else ''} "
+                               f"yet (healing up); guns on their drone control")
+        if not airless and ours >= margin * theirs:
+            return "engage", f"a boarding drone does not suffocate: fighting it ({ours:.0f} vs {theirs:.0f})"
+        if airless and ours >= margin * theirs and (critical or waited >= DRONE_AIRLESS_WAIT or previous == "engage"):
+            return "engage", (f"boarding drone{where} in an airless room: healthy crew go in for a short fight "
+                              f"({ours:.0f} vs {theirs:.0f})")
+        if waited >= DRONE_HOLD_MAX and ours >= FIGHT_HOLD * theirs:
+            return "engage", f"the drone is still there after {waited:.0f}s: fighting it ({ours:.0f} vs {theirs:.0f})"
+        if waited >= DRONE_HOLD_MAX:
+            since[room_id] = now               # start another wait, reassessing all along
+        return "contain", (f"boarding drone{where} ({'airless room, ' if airless else ''}{ours:.0f} vs {theirs:.0f}): "
+                           f"crew keep out of its room; guns on their drone control")
 
     def _lockdown(self, snapshot: GameSnapshot, now: float) -> list[Intent]:
         """Crystal crew can seal the room they stand in. When defending, a Crystal in a safe
@@ -1156,6 +1344,8 @@ class LiveCombatBrain:
         for c in crew:
             room = rid(posts.get(c.address, -1))
             if room is None or heading_to(c, room) or c.address in self.assignments:
+                continue
+            if self._room_full(snapshot, room, c):
                 continue
             if self._due(("boarding", c.address), now, REISSUE_CREW_SECONDS):
                 role = next((r for r, room_id in safe.items() if room_id == room.room_id), "post")
@@ -1282,6 +1472,11 @@ class LiveCombatBrain:
                     reasons.setdefault(address, f"boarders in room {room_id}: venting it to weaken them")
         elif can_vent:
             fighting = {room_id for room_id, _ in self.assignments.values()}
+            # Fire venting waits while crew are on the move (they walk through rooms the vent
+            # path empties: seen, a crew member heading for the medbay suffocated in one) and
+            # while the oxygen system is down (vented rooms would never refill).
+            crew_walking = any(_walking(c) for c in breathers)
+            oxygen_down = oxygen is not None and oxygen.health < oxygen.level
             self.vent_started = getattr(self, "vent_started", {})
             self.vent_given_up = getattr(self, "vent_given_up", {})
             for room in player.rooms:
@@ -1294,8 +1489,10 @@ class LiveCombatBrain:
                         continue          # our crew are going in to fight them
                     why = f"trap the boarders in room {room.room_id} and vent their air"
                 elif room.fires:
-                    if (player.oxygen_total or 1.0) < VENT_MIN_SHIP_AIR:
+                    if (player.oxygen_total or 1.0) < VENT_MIN_SHIP_AIR or oxygen_down:
                         continue          # the ship is short of air already: fight it instead
+                    if crew_walking and not (self.vented_rooms & {room.room_id}):
+                        continue          # do not start a vent while crew are walking about
                     why = f"vent room {room.room_id} to put out {room.fires} fire tile(s)"
                 else:
                     continue
@@ -1390,25 +1587,80 @@ class LiveCombatBrain:
                 _, address = max(lower)
                 self.stations[address] = station
 
+    def _air_crisis(self, snapshot: GameSnapshot) -> bool:
+        """The oxygen system is broken and the ship is running out of air. Healing cannot keep
+        up with suffocation (seen: three crew stuck in the medbay at 0% air, nobody fixing the
+        oxygen because they were all 'too hurt to work'), so repairing it comes first."""
+        player = snapshot.player
+        oxygen = player.systems.get("oxygen")
+        return (oxygen is not None and oxygen.health < oxygen.level
+                and (player.oxygen_total if player.oxygen_total is not None else 1.0) < AIR_CRISIS)
+
     def _medical(self, snapshot: GameSnapshot, now: float) -> list[Intent]:
         player = snapshot.player
         crew = self._own_crew(snapshot)
         medbay = player.systems.get("medbay")
         medbay_room = _room(player.rooms, medbay.room_id) if medbay else None
         if medbay is None or medbay_room is None or medbay.health <= 0:
-            return []
+            return self._fall_back(snapshot, now, crew)
 
         intents = []
         oxygen = player.systems.get("oxygen")
-        emergency = (any(room.fires or room.breaches for room in player.rooms) or bool(self._intruders(snapshot))
+        # (A boarding drone left alone in its room is no reason to stop topping crew up: they
+        # need the health to go in and fight it.)
+        contained = {r for r, plan in self.boarder_plans.items() if plan == "contain"}
+        # (Nor is a breach in an airless room: only the healthy may go in to patch it, so the
+        # crew top up first instead of waiting for it at 60% forever.)
+        emergency = (any(room.fires or (room.breaches and room.room_id not in contained and not self._airless(room))
+                         for room in player.rooms)
+                     or any(c.room_id not in contained for c in self._intruders(snapshot))
                      or (oxygen is not None and oxygen.health < oxygen.level) or bool(snapshot.beacon_hazards))
         # Top everyone up only when the ship is truly quiet; otherwise only the badly hurt go.
         threshold = SEND_TO_MEDBAY if in_combat(snapshot) or emergency else SEND_TO_MEDBAY_AT_PEACE
         if has_augment(snapshot.player, "NANO_MEDBAY"):
             threshold = min(threshold, NANO_MEDBAY_TRIP)   # they heal anywhere (slower)
+        crisis = self._air_crisis(snapshot)
+        if crisis:
+            threshold = AIR_CRISIS_MEDBAY
+            # Let the able go: anyone not badly hurt leaves the medbay to fix the oxygen. With
+            # everyone badly hurt, the healthiest goes anyway: an airless medbay only delays it.
+            able = [c for c in crew if c.health >= AIR_CRISIS_MEDBAY * c.max_health]
+            if not able and crew:
+                able = [max(crew, key=lambda c: c.health / c.max_health)]
+                threshold = 0.0
+            for c in able:
+                self.healing.discard(c.address)
         burning_rooms = {r.room_id for r in snapshot.player.rooms if r.fires}
         burning = lambda c: c.room_id in burning_rooms and not fire_immune(c)   # fire hurts fast: leave earlier
-        wounded = sorted((c for c in crew if c.health < (max(threshold, FIRE_RETREAT) if burning(c) else threshold) * c.max_health),
+        # Two boarders take a crew member from full health to dead in about five seconds (seen:
+        # the door operator alone against two, and an Engi sent back in alone): whoever is
+        # outnumbered outside the medbay falls back to it early. The boarders often follow,
+        # into the room where our side heals.
+        boarders_in: dict[int, float] = {}
+        for b in self._intruders(snapshot):
+            if b.intruder and not b.mind_controlled:
+                boarders_in[b.room_id] = boarders_in.get(b.room_id, 0.0) + self._strength([b])
+        ours_in: dict[int, float] = {}
+        for c in crew:
+            ours_in[c.room_id] = ours_in.get(c.room_id, 0.0) + self._strength([c])
+        # (by strength: a boarding drone has 150 hp, so one crew member alone is outmatched)
+        outnumbered = lambda c: (c.room_id != medbay_room.room_id and medbay.power > 0
+                                 and boarders_in.get(c.room_id, 0.0) > ours_in.get(c.room_id, 0.0))
+
+        breached = {r.room_id for r in player.rooms if r.breaches}
+
+        def retreat_at(c: CrewInfo) -> float:
+            level = threshold
+            job = self.assignments.get(c.address)
+            if job is not None and job[0] in breached:
+                level = min(level, SEND_TO_MEDBAY)   # patching a breach: finish it (no peacetime top-up recall)
+            if burning(c):
+                level = max(level, FIRE_RETREAT)
+            if outnumbered(c):
+                level = max(level, OUTNUMBERED_RETREAT)
+            return level
+
+        wounded = sorted((c for c in crew if c.health < retreat_at(c) * c.max_health),
                          key=lambda c: c.health / c.max_health)
         if wounded and medbay.power == 0:
             spare = (player.reactor_total - player.reactor_used) if player.reactor_total is not None else 0
@@ -1416,10 +1668,39 @@ class LiveCombatBrain:
                 intents.append(Intent(kind="power_system", system="medbay",
                                       reason=f"powering the medbay for {wounded[0].name}"))
 
+        # Boarders holding the medbay (seen: an unpowered, then wrecked medbay, two crew sent
+        # in 2-on-3 and killed): the hurt do not walk into that fight. They fall back to the
+        # boarder-free room where most of our crew stand (the helm first) until it is free.
+        heal_factor = 1.5 if medbay.power > 0 and medbay.health > 0 else 1.0
+        medbay_overrun = boarders_in.get(medbay_room.room_id, 0.0) > heal_factor * ours_in.get(medbay_room.room_id, 0.0)
+        regroup = None
+        if medbay_overrun:
+            gathered: dict[int, float] = {}
+            for c in crew:
+                if c.room_id != medbay_room.room_id and boarders_in.get(c.room_id, 0.0) == 0:
+                    gathered[c.room_id] = gathered.get(c.room_id, 0.0) + self._strength([c])
+            helm = player.systems.get("pilot")
+            if gathered:
+                best = max(gathered, key=lambda r: (gathered[r], helm is not None and r == helm.room_id))
+                regroup = _room(player.rooms, best)
+
         for c in wounded:
+            if medbay_overrun:
+                if regroup is None or heading_to(c, regroup) or self._room_full(snapshot, regroup, c):
+                    continue
+                if self._due(("regroup", c.address), now, REISSUE_CREW_SECONDS):
+                    self.forget(c.address)
+                    self.healing.add(c.address)     # (off duty: the medbay pass sends them on once it is free)
+                    intents.append(Intent(kind="crew_to_room", crew=c, room=regroup,
+                                          reason=f"{c.name} at {c.health:.0f}/{c.max_health:.0f} hp; boarders hold the "
+                                                 f"medbay: falling back to room {regroup.room_id} with the others"))
+                    return intents
+                continue
             if heading_to(c, medbay_room):
                 self.healing.add(c.address)
                 continue
+            if self._room_full(snapshot, medbay_room, c) or self._refused(c.address, medbay_room.room_id):
+                continue                         # every bed taken: wait for one
             if self._due(("medbay", c.address), now, REISSUE_CREW_SECONDS):
                 self.forget(c.address)          # drop any other job
                 self.healing.add(c.address)
@@ -1431,6 +1712,35 @@ class LiveCombatBrain:
             if c.address in self.healing and c.health >= HEALED * c.max_health:
                 self.healing.discard(c.address)   # _return_to_stations sends them back
         return intents
+
+    def _fall_back(self, snapshot: GameSnapshot, now: float, crew: list[CrewInfo]) -> list[Intent]:
+        """No medbay to heal in: crew losing a fight (outmatched in their room, below
+        OUTNUMBERED_RETREAT) leave it for the boarder-free room where most of our crew stand."""
+        boarders_in: dict[int, float] = {}
+        for b in self._intruders(snapshot):
+            if b.intruder and not b.mind_controlled:
+                boarders_in[b.room_id] = boarders_in.get(b.room_id, 0.0) + self._strength([b])
+        if not boarders_in:
+            return []
+        ours_in: dict[int, float] = {}
+        for c in crew:
+            ours_in[c.room_id] = ours_in.get(c.room_id, 0.0) + self._strength([c])
+        losing = [c for c in crew if boarders_in.get(c.room_id, 0.0) > ours_in.get(c.room_id, 0.0)
+                  and c.health < OUTNUMBERED_RETREAT * c.max_health]
+        gathered = {r: v for r, v in ours_in.items() if boarders_in.get(r, 0.0) == 0}
+        if not losing or not gathered:
+            return []
+        helm = snapshot.player.systems.get("pilot")
+        room = _room(snapshot.player.rooms, max(gathered, key=lambda r: (gathered[r], helm is not None and r == helm.room_id)))
+        for c in sorted(losing, key=lambda c: c.health):
+            if room is None or heading_to(c, room) or self._room_full(snapshot, room, c):
+                continue
+            if self._due(("regroup", c.address), now, REISSUE_CREW_SECONDS):
+                self.forget(c.address)
+                return [Intent(kind="crew_to_room", crew=c, room=room,
+                               reason=f"{c.name} at {c.health:.0f}/{c.max_health:.0f} hp, outmatched (no medbay): "
+                                      f"falling back to room {room.room_id} with the others")]
+        return []
 
     def _hazards(self, snapshot: GameSnapshot) -> list[tuple[float, RoomInfo, str, str, int]]:
         """Rooms that need crew, most urgent first: (priority, room, what, job, crew wanted)."""
@@ -1495,6 +1805,18 @@ class LiveCombatBrain:
             add(room, importance + damaged * 0.1, f"{system.name} damaged ({system.health}/{system.level})",
                 "repair", wanted=damaged)
 
+        # A room with boarders in it is a fight first, whatever else is wrong there (seen: a
+        # wrecked medbay's repair outranked its three boarders, and crew went in one by one
+        # "to repair" it, past every check on fights). Not planned as a fight: nobody goes in.
+        for room_id in intruders_by_room:
+            entry = found.get(room_id)
+            if entry is None:
+                continue
+            if self.boarder_plans.get(room_id, "engage") != "engage":
+                del found[room_id]
+            else:
+                entry[3] = "boarders"
+
         # A room with several problems (fire on the oxygen system, say) outranks one with a
         # single problem of the same kind: worst problem plus half of the rest.
         return sorted(((best + 0.5 * (total - best), room, ", ".join(notes), job, wanted)
@@ -1508,12 +1830,19 @@ class LiveCombatBrain:
         # nobody, so everyone works (repairing the medbay comes first, see _hazards).
         medbay = snapshot.player.systems.get("medbay")
         fit_needed = FIT_FOR_DUTY if medbay is not None and medbay.health > 0 else 0.0
+        if self._air_crisis(snapshot):
+            fit_needed = AIR_CRISIS_MEDBAY       # out of air: the oxygen repair cannot wait for healing
+            if not any(c.health >= fit_needed * c.max_health for c in own_crew):
+                fit_needed = 0.0                 # everyone badly hurt: the healthiest still goes
         if safe is not None:
             # Boarding: only rooms that keep their air need crew (fights in the safe rooms,
             # or crew still on their way out); everything else is being vented.
             keep = set(safe.values()) | {c.room_id for c in own_crew}
             keep |= {r for r, plan in self.boarder_plans.items() if plan == "engage"}
             hazards = [h for h in hazards if h[1].room_id in keep]
+        contained = {r for r, plan in self.boarder_plans.items() if plan == "contain"}
+        if contained:
+            hazards = [h for h in hazards if h[1].room_id not in contained]
         hazard_ids = {room.room_id for _, room, _, _, _ in hazards}
 
         # Release jobs whose room is clear; _return_to_stations then sends the crew home.
@@ -1531,11 +1860,31 @@ class LiveCombatBrain:
             free = [c for c in free if self.boarding_posts.get(c.address) not in held]
         combat = in_combat(snapshot)
 
+        oxygen_system = snapshot.player.systems.get("oxygen")
+
         def pick(room: RoomInfo, priority: float, job: str, helper: bool) -> CrewInfo | None:
-            available = [c for c in free if not heading_to(c, room)]   # already there: no order needed
-            if job in ("fire", "breach"):   # badly hurt crew would burn or suffocate (Rock do not burn)
-                available = [c for c in available if c.health >= FIRE_RETREAT / 2 * c.max_health
-                             or (job == "fire" and fire_immune(c))]
+            available = [c for c in free if not heading_to(c, room) and not self._refused(c.address, room.room_id)]
+            if self._airless(room) and not (oxygen_system is not None and room.room_id == oxygen_system.room_id):
+                if job == "boarders" and room.room_id in getattr(self, "airless_fights", set()):
+                    # A drone keeps a breached room airless: the healthy fight it there briefly.
+                    available = [c for c in available if breathes_nothing(c) or c.health >= DRONE_AIRLESS_FIT * c.max_health]
+                elif room.breaches and job != "fire" and room.room_id not in self.vented_rooms:
+                    # A breached room never gets its air back until the breach is fixed (seen:
+                    # the bot waiting forever to jump, nobody allowed into the airless room):
+                    # a healthy crew member patches it; the medbay pass pulls them out if hurt.
+                    available = [c for c in available if breathes_nothing(c) or c.health >= DRONE_AIRLESS_FIT * c.max_health]
+                else:
+                    available = [c for c in available if breathes_nothing(c)]   # no air in there
+            if job == "fire":
+                # Crew sent in at half health were recalled by the burning-room retreat a second
+                # later, leaving one alone in a four-tile fire (seen: dead in five seconds).
+                available = [c for c in available if c.health >= FIRE_FIT * c.max_health or fire_immune(c)]
+            elif job == "breach":           # badly hurt crew would suffocate
+                available = [c for c in available if c.health >= FIRE_RETREAT / 2 * c.max_health]
+            if job == "boarders" and not (medbay is not None and room.room_id == medbay.room_id):
+                # Hurt crew fight boarders only where they heal (seen: a crew member at 40%
+                # pulled out of the medbay into a 4-on-4 fight, down to 2 hp).
+                available = [c for c in available if c.health >= BOARDER_FIT * c.max_health]
             idle = [c for c in available if c.manning < 0 and not c.repairing]
             candidates = idle
             if not candidates:
@@ -1561,13 +1910,30 @@ class LiveCombatBrain:
         # At most one new order per decision: each order is checked before the next one.
         systems = snapshot.player.systems
         oxygen_room = systems["oxygen"].room_id if "oxygen" in systems else None
+        boarder_strength: dict[int, float] = {}
+        for b in self._intruders(snapshot):
+            boarder_strength[b.room_id] = boarder_strength.get(b.room_id, 0.0) + self._strength([b])
         for priority, room, what, job, wanted in hazards:
             if room.room_id in self.vented_rooms:
                 continue  # the air is being let out of this room: keep crew away
+            if job == "boarders":
+                # Only a fight we can win: the crew there plus the best we could send now must
+                # match them (the medbay's healing counts). Otherwise each one sent is lost.
+                heals = (medbay is not None and room.room_id == medbay.room_id and medbay.health > 0 and medbay.power > 0)
+                here = [c for c in own_crew if heading_to(c, room) and c.address not in self.healing]
+                room_size = min(wanted, room_capacity(snapshot, room))
+                spare = sorted((c for c in free if c not in here and (heals or c.health >= BOARDER_FIT * c.max_health)),
+                               key=lambda c: -self._strength([c]))[:max(0, room_size - len(here))]
+                potential = self._strength(here + spare) * (1.5 if heals else 1.0)
+                # Joining a fight already on needs less than starting one (no coin flips). A
+                # drone's room keeps the bar its plan chose (it lowers it after waiting).
+                drone_room = room.room_id in getattr(self, "drone_rooms", set())
+                if potential < (FIGHT_HOLD if here or drone_room else FIGHT_MARGIN) * boarder_strength.get(room.room_id, 0.0):
+                    continue
             if (room.oxygen is not None and room.oxygen < BREATHABLE and job == "fire"
                     and room.room_id != oxygen_room):
                 continue  # almost no air: the fire is dying anyway and crew would suffocate
-            present = sum(1 for c in own_crew if heading_to(c, room))
+            present = sum(1 for c in own_crew if heading_to(c, room) and c.address not in self.healing)   # (not those leaving to heal)
             if present >= min(wanted, room_capacity(snapshot, room)):
                 continue
             crew = pick(room, priority, job, helper=present > 0)
@@ -1576,9 +1942,30 @@ class LiveCombatBrain:
             if not self._due(("crew_to_room", room.room_id, present), now, REISSUE_CREW_SECONDS):
                 continue
             self.assignments[crew.address] = (room.room_id, now)
-            team = f" ({present + 1} of {min(wanted, room_capacity(snapshot, room))})" if wanted > 1 else ""
-            return [Intent(kind="crew_to_room", crew=crew, room=room,
-                           reason=f"room {room.room_id}: {what}; sending {crew.name} ({crew.species}){team}")]
+            size = min(wanted, room_capacity(snapshot, room))
+            team = f" ({present + 1} of {size})" if wanted > 1 else ""
+            orders = [Intent(kind="crew_to_room", crew=crew, room=room,
+                             reason=f"room {room.room_id}: {what}; sending {crew.name} ({crew.species}){team}")]
+            big_fire = job == "fire" and room.fires >= BIG_FIRE
+            if big_fire or job == "boarders":
+                # The whole team goes at once: crew who arrive one by one are cut down one by
+                # one (seen: four crew sent over three seconds, the first killed 4-on-1).
+                free.remove(crew)
+                for n in range(present + 1, size):
+                    extra = pick(room, priority, job, helper=True)
+                    if extra is None:
+                        break
+                    free.remove(extra)
+                    self.assignments[extra.address] = (room.room_id, now)
+                    orders.append(Intent(kind="crew_to_room", crew=extra, room=room,
+                                         reason=f"room {room.room_id}: {what}; sending {extra.name} "
+                                                f"({extra.species}) ({n + 1} of {size}) with the others"))
+                if big_fire and present + len(orders) < 2 and not fire_immune(crew):
+                    for order in orders:            # one alone would burn: vent it or let it be
+                        self.assignments.pop(order.crew.address, None)
+                        free.append(order.crew)
+                    continue
+            return orders
         return []
 
     def _return_to_stations(self, snapshot: GameSnapshot, now: float) -> list[Intent]:
@@ -1593,6 +1980,12 @@ class LiveCombatBrain:
             room = self._station_room(snapshot, station) if station is not None else None
             if room is None or heading_to(c, room):
                 continue
+            if self._airless(room) and not breathes_nothing(c):
+                continue                         # it gets its air back first
+            if room.room_id in self.boarder_plans:
+                continue                         # boarders in there: only _damage_control sends fighters in
+            if self._room_full(snapshot, room, c) or self._refused(c.address, room.room_id):
+                continue                         # no free tile there right now, or just refused
             if self._due(("station", c.address), now, REISSUE_CREW_SECONDS):
                 name = SYSTEM_NAMES.get(station, "station")
                 return [Intent(kind="crew_to_room", crew=c, room=room,
@@ -1606,7 +1999,8 @@ class LiveCombatBrain:
                 continue
             station = open_stations[0]
             room = self._station_room(snapshot, station)
-            if room is None or not self._due(("station", c.address), now, REISSUE_CREW_SECONDS):
+            if room is None or (self._airless(room) and not breathes_nothing(c)) or self._room_full(snapshot, room, c) \
+                    or room.room_id in self.boarder_plans or not self._due(("station", c.address), now, REISSUE_CREW_SECONDS):
                 continue
             self.stations[c.address] = station
             return [Intent(kind="crew_to_room", crew=c, room=room,
@@ -1638,11 +2032,15 @@ class LiveCombatBrain:
         stalled = now - track["since"] > DEADLOCK_SECONDS and not flagship.is_flagship(enemy)
         nearly_won = enemy.hull <= max(2, enemy.max_hull // 4)
         away = [c for c in enemy.crew if c.intruder and not c.dead and not c.mind_controlled]
-        want = (critical and not (nearly_won and player.hull > 3)) or (stalled and not nearly_won)
+        # The Last Stand: a fight with anything but the Flagship only costs hull and the jumps
+        # the chase needs; leave as soon as the FTL drive is charged.
+        side_fight = (snapshot.sector or 0) >= 8 and not flagship.is_flagship(enemy) and not nearly_won
+        want = (critical and not (nearly_won and player.hull > 3)) or (stalled and not nearly_won) or side_fight
         self.escaping = want and not away
         if not self.escaping:
             return []
         why = (f"hull {player.hull}/{player.max_hull}" if critical
+               else "Last Stand: no time for side fights, back to chasing the Flagship" if side_fight and not stalled
                else f"no damage dealt for {now - track['since']:.0f}s (enemy hull {enemy.hull}/{enemy.max_hull})")
         engines = player.systems.get("engines")
         if not player.jump_ready or engines is None or engines.power <= 0:
@@ -1651,4 +2049,5 @@ class LiveCombatBrain:
             return []
         if not self._due(("escape",), now, REISSUE_TARGET_SECONDS * 5):
             return []
-        return [Intent(kind="escape", reason=f"{why}: the fight is not winnable, jumping away")]
+        verdict = "jumping away" if side_fight and not critical and not stalled else "the fight is not winnable, jumping away"
+        return [Intent(kind="escape", reason=f"{why}: {verdict}")]

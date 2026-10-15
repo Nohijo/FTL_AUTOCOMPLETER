@@ -120,9 +120,11 @@ def pods(snapshot: GameSnapshot) -> list[Pod]:
     return sorted(found, key=lambda p: -p.threat)
 
 
-def targets(snapshot: GameSnapshot, defended: bool, have_launchers: bool) -> list[tuple[str, RoomInfo]]:
+def targets(snapshot: GameSnapshot, defended: bool, have_launchers: bool,
+            drones_aboard: bool = False) -> list[tuple[str, RoomInfo]]:
     """Rooms to aim at, in order: (label, room). Pods first; in stage 2 the drone control
-    first when a defense drone is shooting our missiles down."""
+    first when a defense drone is shooting our missiles down, or when its boarding drones
+    are aboard (losing the drone control destroys them)."""
     enemy = snapshot.enemy
     stage = enemy.boss_stage
     rooms = {r.room_id: r for r in enemy.rooms}
@@ -133,7 +135,7 @@ def targets(snapshot: GameSnapshot, defended: bool, have_launchers: bool) -> lis
         if sys is not None and sys.health > 0 and sys.room_id in rooms:
             order.append((name, rooms[sys.room_id]))
 
-    if defended and have_launchers:
+    if (defended and have_launchers) or drones_aboard:
         system("drones")
     order += [(p.label, p.room) for p in pods(snapshot)]
     for name in STAGE_SYSTEMS.get(stage, STAGE_SYSTEMS[1]):
