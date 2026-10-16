@@ -28,12 +28,46 @@ DISCOUNT = 0.97              # later rewards count slightly less (more can go wr
 HAZARD_PENALTY = 6.0         # beacons with a sun, asteroids, ion storm, pulsar...
 LEAVE_SECTOR_BONUS = 3.0     # small preference for moving on when nothing is worth the detour
 
-# Rough preference for the next sector by type: homeworld sectors tend to have
-# good events, nebulas switch off sensors.
-SECTOR_PREFERENCE = {
-    "CIVILIAN": 3, "ENGI": 3, "ZOLTAN": 3, "MANTIS": 1, "ROCK": 1,
-    "PIRATE": 1, "HOSTILE": 1, "REBEL": 0, "SLUG": -1, "NEBULA": -1,
-}
+# Preference for the next sector by type (strategy reference, FTL_STRATEGY.md section 6): green
+# sectors (civilian, Engi, Zoltan, pirate) are forgiving and good for scrap early; Mantis are
+# red but easy with two shield layers; Rock, Rebel and (late) Zoltan ships bring missiles,
+# drones and super shields; Slug / uncharted sectors pay little and are nasty. The harsh ones are
+# taken only by a ship that can answer them (STRONG_SHIELDS layers and STRONG_WEAPON_POWER bars).
+STRONG_SHIELDS = 3
+STRONG_WEAPON_POWER = 6
+HARSH_SECTORS = {"ROCK": -3, "REBEL": -3, "SLUG": -4, "UNCHARTED": -4}
+
+
+def sector_value(kind: str, sector: int, strong: bool) -> float:
+    """How much the bot wants the sector of this kind as its next one (higher is better)."""
+    kind = kind.upper()
+    late = sector >= 4
+    if "NEBULA" in kind:
+        return -4 if late else -1                  # unmanned ships out-gun the ship there once it matters
+    for key, penalty in HARSH_SECTORS.items():
+        if key in kind:
+            value = 0.0 if strong else penalty
+            if "MINIBOSS" in kind:
+                value -= 0 if strong else 2
+            return value + (0.5 if "HOME" in kind else 0)
+    if "ZOLTAN" in kind:
+        value = 3.0 if not late else (2.0 if strong else 0.5)   # super shields soak volleys later
+    elif "ENGI" in kind:
+        value = 3.0 if not late or strong else 2.0
+    elif "CIVILIAN" in kind:
+        value = 3.0 + (1.0 if sector >= 6 else 0.0)            # the green stop to heal before the Last Stand
+    elif "MANTIS" in kind:
+        value = 2.5 if strong or sector <= 4 else 1.0
+    elif "PIRATE" in kind:
+        value = 1.5
+    else:
+        value = 0.0
+    return value + (0.5 if "HOME" in kind else 0)
+
+
+def _strong(player) -> bool:
+    weapon_power = sum(w.required_power for w in player.weapons)
+    return player.max_shield_layers >= STRONG_SHIELDS and weapon_power >= STRONG_WEAPON_POWER
 
 
 @dataclass
@@ -349,10 +383,12 @@ def choose_sector(state: StarMapState, snapshot: GameSnapshot) -> int | None:
         return None
     healthy = snapshot.player.hull >= 0.7 * snapshot.player.max_hull
 
+    strong = _strong(snapshot.player)
+    sector = snapshot.sector or 1
+
     def score(option) -> float:
-        kind = option.kind.upper()
-        value = next((v for key, v in SECTOR_PREFERENCE.items() if key in kind), 0)
-        if "HOSTILE" in kind and healthy:
+        value = sector_value(option.kind, sector, strong)
+        if "HOSTILE" in option.kind.upper() and healthy:
             value += 1  # more fights, more scrap, when the ship can take it
         return value
 

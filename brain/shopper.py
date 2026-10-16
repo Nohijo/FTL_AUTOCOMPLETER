@@ -25,6 +25,7 @@ from observer.memory.reader import GameSnapshot
 from observer.memory.store import StoreItem, StoreState
 
 VALUE_PER_SCRAP = 1.0          # buy only what is worth at least its price
+FUEL_TARGET_EARLY = 25         # fuel to carry out of sector 3 (cheap early, stranding is fatal later)
 RESERVE = 12                   # scrap kept back for fuel and repairs when buying non-essentials...
 RESERVE_HEALTHY = 5            # ...or this much when fuel and hull are fine
 
@@ -78,7 +79,10 @@ def _supply_values(store: StoreState, snapshot: GameSnapshot) -> list[tuple[Stor
             out.append((item, per_point * max(1, item.cost) / 2, f"hull {player.hull}/{player.max_hull}",
                         hull < (0.8 if last_stand else 0.5)))
         elif item.kind == "item" and "fuel" in name:
-            value = 10 if player.fuel < 4 else 6 if player.fuel < 8 else 3.5 if player.fuel < 12 else 0
+            # Strategy reference: leave sector 3 with 25+ fuel, while prices are lowest.
+            early = (snapshot.sector or 1) <= 3
+            value = (10 if player.fuel < 4 else 6 if player.fuel < 8 else 3.5 if player.fuel < 12
+                     else 3.5 if early and player.fuel < FUEL_TARGET_EARLY else 0)
             out.append((item, value, f"fuel {player.fuel}", player.fuel < 4))
         elif item.kind == "item" and "missile" in name and has_launcher:
             value = 14 if player.missiles < 3 else 8 if player.missiles < 6 else 0

@@ -189,5 +189,42 @@ class Volleys(unittest.TestCase):
         self.assertEqual(sorted(it.kind for it in intents), ["target", "target"])
 
 
+class Strategy(unittest.TestCase):
+    """Rules from the strategy reference (FTL_STRATEGY.md)."""
+
+    def test_harsh_sectors_only_for_a_strong_ship(self):
+        from brain.navigator import sector_value
+        for kind in ("ROCK_SECTOR", "REBEL_SECTOR", "SLUG_SECTOR", "REBEL_SECTOR_MINIBOSS"):
+            self.assertLess(sector_value(kind, 4, False), sector_value("CIVILIAN_SECTOR", 4, False), kind)
+            self.assertGreaterEqual(sector_value(kind, 4, True), sector_value(kind, 4, False), kind)
+
+    def test_nebula_sector_is_fine_early_and_bad_late(self):
+        from brain.navigator import sector_value
+        self.assertGreater(sector_value("NEBULA_SECTOR", 2, False), sector_value("NEBULA_SECTOR", 5, False))
+
+    def test_zoltan_cools_off_late(self):
+        from brain.navigator import sector_value
+        self.assertGreater(sector_value("ZOLTAN_SECTOR", 2, False), sector_value("ZOLTAN_SECTOR", 5, False))
+
+    def test_cloaking_before_the_fourth_shield_layer(self):
+        from brain.upgrader import plan_upgrade
+        from observer.memory.upgrades import UpgradeOption, UpgradesState
+        ship = snapshot(BASE).player
+        ship.scrap = 400
+        levels = {"shields": 6, "engines": 5, "pilot": 3, "doors": 2, "medbay": 2, "oxygen": 2, "sensors": 2,
+                  "weapons": 7, "cloaking": 1}
+        options = [UpgradeOption(address=i, system=name, type_id=i, level=level, max_level=8, next_cost=60,
+                                 rect=(0, 0, 1, 1), hover=False, pending=0) for i, (name, level) in enumerate(levels.items())]
+        state = UpgradesState(open=True, address=0, position=(0, 0), options=options)
+        ship.reactor_total = 25
+        plan = plan_upgrade(state, ship)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan[0], "cloaking")
+
+    def test_early_fuel_is_bought_up_to_25(self):
+        import brain.shopper as shopper
+        self.assertEqual(shopper.FUEL_TARGET_EARLY, 25)
+
+
 if __name__ == "__main__":
     unittest.main()

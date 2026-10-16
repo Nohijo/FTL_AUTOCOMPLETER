@@ -48,7 +48,7 @@ def plan_upgrade(state: UpgradesState, ship: ShipInfo, profile=None) -> tuple[st
     steps = [
         ("shields", 4, "a second shield layer"),
         ("reactor", None, "power for the systems"),
-        ("engines", 3, "dodge chance"),
+        ("engines", 4, "dodge chance"),
         ("weapons", max(1, _weapons_power(ship)), "power for every weapon"),
         ("pilot", 2, "dodge chance"),
         ("shields", 6, "a third shield layer"),
@@ -59,10 +59,12 @@ def plan_upgrade(state: UpgradesState, ship: ShipInfo, profile=None) -> tuple[st
         ("sensors", 2, "see the enemy ship"),
         ("weapons", 6, "room for stronger weapons"),
         ("pilot", 3, "dodge chance"),
+        # Cloaking level 2 is a must for the Flagship (strategy reference, section 10), so it
+        # comes before the fourth layer.
+        ("cloaking", 2, "a cloak long enough for the Flagship's volleys"),
         ("shields", 8, "a fourth shield layer"),
         # Late game: keep turning scrap into strength (the list used to end here, so scrap
         # piled up unused once the shields were maxed).
-        ("cloaking", 2, "longer cloak"),
         ("engines", 6, "dodge chance"),
         ("weapons", 7, "room for stronger weapons"),
         ("medbay", 3, "faster healing"),
