@@ -146,6 +146,26 @@ class Fires(unittest.TestCase):
         self.assertNotIn(8, [r for _, r, _ in g.orders(3)])
 
 
+    def test_big_fire_is_vented_before_a_team_goes_in(self):
+        # Seen: three crew sent into a 4-tile medbay fire, all dead within six seconds.
+        g = Game(BASE, rooms={8: {"fires": 4}})
+        vented, sent = False, False
+        for _ in range(8):
+            for it in g.step(1.0):
+                vented |= it.kind == "door"
+                sent |= it.kind == "crew_to_room" and it.room.room_id == 8
+        self.assertTrue(vented, "the doors were never used on a four-tile fire")
+        self.assertFalse(sent, "crew walked into the blaze while it was being vented")
+
+    def test_big_fire_goes_to_a_team_when_it_cannot_be_vented(self):
+        g = Game(BASE, rooms={8: {"fires": 4}}, systems={"doors": {"health": 0}})
+        self.assertGreaterEqual(len([1 for _, r, _ in g.orders(1) if r == 8]), 2)
+
+    def test_hurt_crew_do_not_heal_in_a_burning_medbay(self):
+        g = Game(heal(BASE, 20.0, {"Ryan"}), rooms={4: {"fires": 3}})
+        self.assertNotIn(("Ryan", 4), [(n, r) for n, r, _ in g.orders(2)])
+
+
 class Breaches(unittest.TestCase):
     def test_airless_breach_gets_patched(self):
         # Seen: the bot waiting forever to jump; nobody allowed into the airless breached room.
@@ -187,6 +207,18 @@ class Volleys(unittest.TestCase):
     def test_guns_that_get_through_alone_fire_alone(self):
         intents = self.fight([weapon("LASER_BURST_2", 3, 12, 12), weapon("LASER_HEAVY_2", 2, 13, 13)], layers=1)
         self.assertEqual(sorted(it.kind for it in intents), ["target", "target"])
+
+
+class Readiness(unittest.TestCase):
+    def test_weapons_are_powered_between_fights(self):
+        # Seen: arrived at a beacon with every gun dark; the enemy fired ten seconds before we did.
+        snap = snapshot(BASE)
+        snap.player.reactor_total, snap.player.reactor_used = 14, 5
+        w = dataclasses.replace(weapon("LASER_BURST_3", 3, 12, 0), powered=False)
+        snap.player.weapons = [w]
+        snap.player.systems["weapons"] = dataclasses.replace(snap.player.systems["weapons"], power=0, level=3, health=3)
+        intents = LiveCombatBrain().decide(snap, 100.0)
+        self.assertIn("power_weapon", [it.kind for it in intents])
 
 
 class Strategy(unittest.TestCase):

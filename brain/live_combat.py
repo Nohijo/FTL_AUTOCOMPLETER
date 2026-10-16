@@ -67,6 +67,7 @@ SEND_TO_MEDBAY = 0.40
 NANO_MEDBAY_TRIP = 0.25
 FIRE_RETREAT = 0.6
 FIRE_FIT = 0.75                    # only crew this healthy go into a fire (well above FIRE_RETREAT: no recall loop)
+BIG_FIRE_VENT_WAIT = 6.0           # a big fire is left to the vent this long before a team goes in
 BIG_FIRE = 3                       # fire tiles from which a room is fought by a team that goes together, never one alone
 OUTNUMBERED_RETREAT = 0.6          # leave a fight outside the medbay below this when boarders outnumber us there
 VENT_MIN_SHIP_AIR = 0.4
@@ -293,6 +294,11 @@ class LiveCombatBrain:
         intents = self._fire_plan(snapshot, now)
         intents += self._manage_power(snapshot, now)
         intents += self._deploy_drones(snapshot, now)
+        if not in_combat(snapshot):
+            # Weapons charge only while powered, and many fights start the moment the ship
+            # arrives (seen: sector 1, weapons dark on arrival, the first volley ten seconds
+            # after the enemy's, ship lost): keep them powered and charged between fights.
+            intents += self._power_weapons(snapshot, now)
         if in_combat(snapshot):
             intents += self._power_weapons(snapshot, now)
             # (a weapon losing its power in this decision is not aimed in it too)
@@ -1631,6 +1637,9 @@ class LiveCombatBrain:
             for c in able:
                 self.healing.discard(c.address)
         burning_rooms = {r.room_id for r in snapshot.player.rooms if r.fires}
+        for room_id in list(getattr(self, "fire_wait", {})):
+            if room_id not in burning_rooms:
+                del self.fire_wait[room_id]
         burning = lambda c: c.room_id in burning_rooms and not fire_immune(c)   # fire hurts fast: leave earlier
         # Two boarders take a crew member from full health to dead in about five seconds (seen:
         # the door operator alone against two, and an Engi sent back in alone): whoever is
@@ -1673,6 +1682,9 @@ class LiveCombatBrain:
         # boarder-free room where most of our crew stand (the helm first) until it is free.
         heal_factor = 1.5 if medbay.power > 0 and medbay.health > 0 else 1.0
         medbay_overrun = boarders_in.get(medbay_room.room_id, 0.0) > heal_factor * ours_in.get(medbay_room.room_id, 0.0)
+        # A burning medbay is no place to heal (seen: hurt crew sent to a medbay on fire, then
+        # three more into its four-tile blaze: four dead in six seconds).
+        medbay_overrun = medbay_overrun or (medbay_room.fires >= 2 and not any(fire_immune(c) for c in crew))
         regroup = None
         if medbay_overrun:
             gathered: dict[int, float] = {}
@@ -1712,6 +1724,24 @@ class LiveCombatBrain:
             if c.address in self.healing and c.health >= HEALED * c.max_health:
                 self.healing.discard(c.address)   # _return_to_stations sends them back
         return intents
+
+    def _can_vent_fire(self, snapshot: GameSnapshot, room: RoomInfo) -> bool:
+        """_vent would open a path to space for this burning room: working doors, a path through
+        rooms nobody breathes in, air to spare, the oxygen system up, venting not given up on."""
+        player = snapshot.player
+        doors = player.systems.get("doors")
+        oxygen = player.systems.get("oxygen")
+        if not (player.doors and doors is not None and doors.health > 0 and doors.power > 0 and doors.ion_lock == 0):
+            return False
+        if (oxygen is not None and oxygen.health < oxygen.level) or (player.oxygen_total or 1.0) < VENT_MIN_SHIP_AIR:
+            return False
+        if self.now < getattr(self, "vent_given_up", {}).get(room.room_id, 0.0):
+            return False
+        occupied = {c.room_id for c in self._own_crew(snapshot) if not breathes_nothing(c)}
+        if room.room_id in occupied:
+            return False
+        path, _ = self._vent_path(player, room.room_id, occupied)
+        return bool(path)
 
     def _fall_back(self, snapshot: GameSnapshot, now: float, crew: list[CrewInfo]) -> list[Intent]:
         """No medbay to heal in: crew losing a fight (outmatched in their room, below
@@ -1916,6 +1946,11 @@ class LiveCombatBrain:
         for priority, room, what, job, wanted in hazards:
             if room.room_id in self.vented_rooms:
                 continue  # the air is being let out of this room: keep crew away
+            if job == "fire" and room.fires >= BIG_FIRE:
+                self.fire_wait = getattr(self, "fire_wait", {})
+                waited_since = self.fire_wait.setdefault(room.room_id, now)
+                if now - waited_since < BIG_FIRE_VENT_WAIT and self._can_vent_fire(snapshot, room):
+                    continue                     # the doors take this one: crew only go in if the vent does not start
             if job == "boarders":
                 # Only a fight we can win: the crew there plus the best we could send now must
                 # match them (the medbay's healing counts). Otherwise each one sent is lost.
